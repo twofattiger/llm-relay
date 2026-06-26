@@ -47,6 +47,9 @@ npx wrangler secret put MY_API_KEY
 
 # 2. 注入 Cloudflare API Token (必须包含 AI Gateway Run 和 Workers AI Read 权限)
 npx wrangler secret put CF_API_TOKEN
+
+# 3. 注入管理员密码
+npx wrangler secret put ADMIN_PASSWORD
 ```
 *(注：如果需要专门为 Anthropic 补发 key，可按需注入 `ANTHROPIC_API_KEY`，详情见详细文档)*
 
