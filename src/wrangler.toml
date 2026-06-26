@@ -5,6 +5,7 @@ compatibility_date = "2026-06-10"
 # 非敏感变量(明文)
 [vars]
 ACCOUNT_ID = "你的_CLOUDFLARE_账号ID"
+# 在cloudflate 创建AI gateway取的给的名字
 GATEWAY = "cf-ai-gateway"
 # 管理面板查 Worker 用量时用,需与上面的 name 一致
 WORKER_NAME = "llm-relay"
