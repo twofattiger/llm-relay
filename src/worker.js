@@ -314,7 +314,9 @@ function handleAdminLogout() {
 async function handleAdminStats(req, env) {
   if (!(await verifySession(req, env))) return json({ error: "Unauthorized" }, 401);
 
-  const hours = Math.min(Math.max(parseInt(new URL(req.url).searchParams.get("hours") || "24", 10) || 24, 1), 720);
+  // 支持小数小时(0.5 = 30 分钟);下限 1 分钟,上限 30 天
+  const raw = parseFloat(new URL(req.url).searchParams.get("hours") || "24");
+  const hours = Math.min(Math.max(Number.isFinite(raw) ? raw : 24, 1 / 60), 720);
   const end = new Date();
   const start = new Date(end.getTime() - hours * 3600 * 1000);
   const script = env.WORKER_NAME || "llm-relay";
@@ -334,7 +336,7 @@ async function handleAdminStats(req, env) {
         }
         gateway: aiGatewayRequestsAdaptiveGroups(
           limit: $limit
-          filter: { datetimeHour_geq: $start, datetimeHour_leq: $end }
+          filter: { datetimeMinute_geq: $start, datetimeMinute_leq: $end }
           orderBy: [count_DESC]
         ) {
           count
@@ -419,7 +421,7 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   <div class="row" style="justify-content:space-between">
     <h1 style="margin:0">llm-relay 面板</h1>
     <div class="row">
-      <select id="hours"><option value="24">近 24 小时</option><option value="168">近 7 天</option><option value="720">近 30 天</option></select>
+      <select id="hours"><option value="0.5">近 30 分钟</option><option value="2">近 2 小时</option><option value="6">近 6 小时</option><option value="24" selected>近 24 小时</option><option value="168">近 7 天</option><option value="720">近 30 天</option></select>
       <button id="refresh" class="ghost">刷新</button>
       <button id="logout" class="ghost">退出</button>
     </div>
@@ -474,9 +476,11 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
       $("wcards").innerHTML=
         card(d.worker.requests,"请求数")+card(d.worker.errors,"错误数")+card(d.worker.subrequests,"子请求(上游调用)");
       var tb=$("gtbl").querySelector("tbody"); tb.innerHTML="";
-      for(var i=0;i<d.gateway.rows.length;i++){var row=d.gateway.rows[i];var tr=document.createElement("tr");
+      var rows=d.gateway.rows, CAP=50, shown=rows.slice(0,CAP);
+      for(var i=0;i<shown.length;i++){var row=shown[i];var tr=document.createElement("tr");
         tr.innerHTML="<td>"+esc(row.model)+"</td><td>"+esc(row.provider)+"</td><td class=n>"+row.count+"</td>";tb.appendChild(tr);}
-      $("gmeta").textContent="网关总请求 "+d.gateway.total+(d.gateway.rows.length?"":" (此窗口无数据)");
+      var note=rows.length>CAP?(" — 仅显示请求数最高的 "+CAP+"/"+rows.length+" 个模型"):"";
+      $("gmeta").textContent="网关总请求 "+d.gateway.total+(rows.length?note:" (此窗口无数据)");
     }catch(e){$("meta").textContent="";$("err").textContent="查询失败:\\n"+e.message;}
   }
   function card(v,l){return "<div class=card><div class=v>"+v+"</div><div class=l>"+l+"</div></div>";}
