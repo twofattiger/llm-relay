@@ -3,18 +3,24 @@
 //   POST /v1/chat/completions  → OpenAI 格式
 //   POST /v1/messages          → Anthropic 格式
 // 每个入口再按 model 前缀分流:无前缀=BYOK / @cf/=Workers AI / @/=统一计费
+//
 // 环境变量说明:
-//   MY_API_KEY    对外鉴权用的自有 key
-//   CF_API_TOKEN  唯一的 Cloudflare API token(需含 AI Gateway Read/Edit + Workers AI Read 权限)
-//                 同时用于 cf-aig-authorization(BYOK 路由)和 Authorization Bearer(REST 路由)
+//   MY_API_KEY    对外鉴权用的自有 key;客户端用 `Authorization: Bearer` 或 `x-api-key` 携带
+//                 (OpenAI SDK 用前者,Anthropic SDK / Claude Code 用后者)
+//   CF_API_TOKEN  唯一的 Cloudflare API token,同时用于:
+//                   - cf-aig-authorization(BYOK 路由,gateway.ai.cloudflare.com)→ 需 AI Gateway Run
+//                   - Authorization Bearer(REST 路由,api.cloudflare.com/.../ai/*:@cf/ 和 @/)→ 需 Workers AI Read
+//                 ⚠ 必须手动建一个权限给全的 token:AI Gateway Run + Workers AI Read(+ 可选 Read/Edit)。
+//                   仅给 Read/Edit 而漏 Run,会导致 BYOK 路由认证失败。
 //   ACCOUNT_ID    Cloudflare 账号 ID
 //   GATEWAY       AI Gateway 网关名称
+//   ANTHROPIC_API_KEY  (可选)仅当 §1.4 验证出 Anthropic BYOK 不可用、需 Worker 补 x-api-key 时才配
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Authorization, Content-Type, anthropic-version, anthropic-beta",
+    "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -42,7 +48,11 @@ export default {
     }
 
     // 自有 API key 鉴权
-    const token = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
+    // 同时接受 Authorization: Bearer <key>(OpenAI SDK)和 x-api-key: <key>(Anthropic SDK / Claude Code)
+    const token =
+      (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") ||
+      req.headers.get("x-api-key") ||
+      "";
     if (!safeEqual(token, env.MY_API_KEY)) {
       return json({ error: { message: "Unauthorized", type: "authentication_error" } }, 401);
     }
@@ -87,6 +97,7 @@ export default {
       // 可选:若 Anthropic BYOK 验证不通过,取消下一行注释,让 Worker 补 x-api-key
       // if (route.byok && env.ANTHROPIC_API_KEY) fwdHeaders["x-api-key"] = env.ANTHROPIC_API_KEY;
     }
+    // 注意:绝不把客户端传来的 x-api-key(那是 MY_API_KEY)转发给上游 —— fwdHeaders 完全重建,不复制它。
 
     // 转发(支持流式)
     let upstream;
