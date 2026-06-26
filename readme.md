@@ -168,12 +168,10 @@ Dashboard → AI Gateway → **Credits Available → Manage → Top-up**(先加 
 > 全程 `npx wrangler`,无需全局安装。需 Node.js ≥ 18。
 > `wrangler.toml` 在 `src/` 下,**所有 wrangler 命令都在 `src/` 目录里执行**(或在任意位置加 `-c src/wrangler.toml` 指定配置文件)。下面以 `cd src` 为准。
 
-### 5.1 安装依赖
+### 5.1 准备环境
 
 ```bash
 cd llm-relay/src                  # wrangler.toml 所在目录,在此执行所有 wrangler 命令
-npm init -y                       # 若还没有 package.json
-npm install --save-dev wrangler
 
 # 本地开发用:在 src/ 下手动创建 .dev.vars 并填入 secret(勿提交)
 cat > .dev.vars <<'EOF'
