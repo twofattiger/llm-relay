@@ -1,0 +1,41 @@
+name = "llm-relay"
+main = "worker.js"
+compatibility_date = "2026-06-10"
+
+# 非敏感变量(明文)
+[vars]
+ACCOUNT_ID = "你的_CLOUDFLARE_账号ID"
+# 在cloudflate 创建AI gateway取的给的名字
+GATEWAY = "cf-ai-gateway"
+# 管理面板查 Worker 用量时用,需与上面的 name 一致
+WORKER_NAME = "llm-relay"
+
+# ---- 管理面板登录防爆破:Durable Object(可选但推荐) ----
+# 不需要面板/防爆破可整段删掉;DO 删掉后 worker.js 会自动跳过防护。
+[[durable_objects.bindings]]
+name = "LOGIN_GUARD"
+class_name = "LoginGuard"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LoginGuard"]   # SQLite 版 DO,免费档可用
+
+# 敏感变量(secret),用 npx wrangler secret put 注入,勿明文写在此文件
+# -------------------------------------------------------------------------
+# 1. 对外发放的 API key(客户端用 Authorization: Bearer 或 x-api-key 携带)
+# npx wrangler secret put MY_API_KEY
+#
+# 2. Cloudflare API Token —— 一个 token 同时用于 cf-aig-authorization(BYOK)
+#    和 Authorization Bearer(REST)。手动创建,权限给全:
+#      AI Gateway — Run         (BYOK 路由必需,漏了无前缀路由会认证失败)
+#      Workers AI — Read        (@cf/ 路由)
+#      Account Analytics — Read (管理面板查 GraphQL 统计;不开面板可不要)
+#      AI Gateway — Read/Edit   (可选,仅当还想管理网关配置)
+# npx wrangler secret put CF_API_TOKEN
+#
+# 3. 管理面板登录密码(配了它才启用 /admin 面板)
+# npx wrangler secret put ADMIN_PASSWORD
+#
+# 4. Anthropic API Key(可选,仅当 Anthropic BYOK 需 Worker 补 x-api-key 时)
+# npx wrangler secret put ANTHROPIC_API_KEY
+# -------------------------------------------------------------------------
