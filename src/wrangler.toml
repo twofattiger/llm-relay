@@ -1,0 +1,23 @@
+name = "llm-relay"
+main = "src/worker.js"
+compatibility_date = "2026-06-10"
+
+# 非敏感变量(明文)
+[vars]
+ACCOUNT_ID = "你的_CLOUDFLARE_账号ID"
+GATEWAY = "cf-ai-gateway"
+
+# 敏感变量(MY_API_KEY / CF_API_TOKEN / 可选 ANTHROPIC_API_KEY)
+# -------------------------------------------------------------------------
+# 为了安全起见，请勿在此文件明文填写这些敏感变量！
+# 请在本地终端中运行以下命令，然后按提示逐个输入对应的值进行注入：
+# 
+# 1. 客户端请求时的验证密钥 (自定义)
+# npx wrangler secret put MY_API_KEY
+# 
+# 2. Cloudflare API Token (需要具有 Workers AI 等调用权限)
+# npx wrangler secret put CF_API_TOKEN
+# 
+# 3. Anthropic API Key (如果需要使用 Anthropic 模型，可选)
+# npx wrangler secret put ANTHROPIC_API_KEY
+# -------------------------------------------------------------------------
