@@ -1,5 +1,5 @@
 name = "llm-relay"
-main = "src/worker.js"
+main = "worker.js"
 compatibility_date = "2026-06-10"
 
 # 非敏感变量(明文)
