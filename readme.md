@@ -11,6 +11,8 @@
 
 该代理统一隐藏了 Cloudflare 账号凭证和各大模型提供商的 API Key，对外只要求使用一个你自定义的 API Key 进行鉴权，同时完整保留 AI Gateway 的请求日志、用量分析等可观测性功能。
 
+![后台管理面板主界面](./src/images/main.jpg)
+
 > **详细说明：** 关于项目的核心架构、计费路由逻辑、环境变量说明以及各模型的调用示例，请务必查看最详细的项目说明文档：[`src/readme.md`](./src/readme.md)。
 
 ## 部署方式
@@ -35,17 +37,21 @@ npx wrangler login
 
 编辑 `src/wrangler.toml` 文件，填写你的 Cloudflare 配置：
 - `ACCOUNT_ID`：你的 Cloudflare 账号 ID
+  ![Account ID](./src/images/accountid.jpg)
 - `GATEWAY`：你在 Cloudflare AI Gateway 中创建的网关名称
+  ![Create AI Gateway](./src/images/create.jpg)
 
 ### 4. 注入敏感密钥 (Secrets)
 
-运行以下命令，将密码等敏感信息安全地注入到 Cloudflare：
+运行以下命令，将密码等敏感信息安全地注入到 Cloudflare。其中 Cloudflare API Token 必须包含 `AI Gateway Run` 和 `Workers AI Read` 权限，权限勾选示例如下：
+
+![CF API Token Grant](./src/images/grant.jpg)
 
 ```bash
 # 1. 注入你自定义的对外分发 API Key
 npx wrangler secret put MY_API_KEY
 
-# 2. 注入 Cloudflare API Token (必须包含 AI Gateway Run 和 Workers AI Read 权限)
+# 2. 注入 Cloudflare API Token
 npx wrangler secret put CF_API_TOKEN
 
 # 3. 注入管理员密码
