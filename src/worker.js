@@ -61,10 +61,6 @@ export default {
     // 管理面板(放在 MY_API_KEY 校验之前;仅在配置了 ADMIN_PASSWORD 时启用)
     if (env.ADMIN_PASSWORD) {
       const p = new URL(req.url).pathname;
-      // 根路径直达面板:GET / → 跳转 /admin
-      if (req.method === "GET" && (p === "/" || p === "")) {
-        return Response.redirect(new URL("/admin", req.url).toString(), 302);
-      }
       if (p === "/admin" || p === "/admin/") {
         return new Response(ADMIN_HTML, {
           status: 200,
