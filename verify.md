@@ -172,6 +172,51 @@ curl -s -X POST "$BASE/v1/messages" \
 
 ---
 
+## 扩展接入：OpenRouter / Ollama 等更多 provider
+
+本中继**不硬编码 provider 列表**，无前缀路由只是把 `provider/model` 原样转发给 AI Gateway 的 compat 端点。所以**凡是 AI Gateway 支持的 provider，存好 BYOK key 就能用，无需改代码**——这些本质都是路由 ②（无前缀 BYOK），区别只在 provider slug 和 model 写法。
+
+> 也都能配合协议转换（⑤）在 `/v1/messages` / Claude Code 上用：把 model 换成下面这些 `provider/model` 即可（不以 `claude` 开头 → 自动转换）。
+
+### OpenRouter（AI Gateway 内置 provider）
+
+前提：AI Gateway → **Provider Keys** → Add API Key → 选 **OpenRouter** → 填你自己的 OpenRouter key。
+
+```bash
+# OpenRouter 的模型 ID 本身带斜杠(vendor/model)，前面再加 openrouter/，故为两层
+curl -i -X POST "$BASE/v1/chat/completions" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"openrouter/openai/gpt-4o","messages":[{"role":"user","content":"你好"}]}'
+```
+
+- **成功标志**：200 + OpenAI 格式回复。
+- **确认是 BYOK**：去 OpenRouter 后台看用量出现这次调用 = 用了你的 key；不扣 CF credits。
+- **模型 ID 以 OpenRouter 为准**：在 OpenRouter 的 models 列表查到的 `vendor/model`，统一前面加 `openrouter/`。
+- ⚠ 即便是 `openrouter/anthropic/claude-...`，因前缀是 `openrouter` 而非 `claude`，在 `/v1/messages` 上**也走协议转换**（而非原生 Anthropic）。OpenRouter 本就用 OpenAI 格式对外，没问题。
+
+### Ollama（本地模型，需先暴露成公网可达）
+
+⚠ **关键限制**：AI Gateway 跑在 Cloudflare 云端，**够不到你本机的 `http://localhost:11434`**。要经本中继+AI Gateway 用 Ollama，必须先把 Ollama 暴露成一个**公网可达**的地址（如 Cloudflare Tunnel / 公网反代 / 带公网 IP 的服务器）。
+
+前提：
+1. Ollama 已起，并通过隧道/反代拿到公网根地址，如 `https://ollama.yourdomain.com`。
+2. AI Gateway → Provider Keys → 添加一个 **custom / OpenAI-compatible provider**，**Base URL 只填根地址、不要带 `/v1`**（Ollama 的 OpenAI 兼容端点在 `/v1/chat/completions`，带了会变 `/v1/v1/...` → 404）；记下你给它起的 slug（如 `my-ollama`）。Ollama 默认无需 key，若后台要求填则填占位。
+
+```bash
+curl -i -X POST "$BASE/v1/chat/completions" \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"my-ollama/llama3.2","messages":[{"role":"user","content":"你好"}]}'
+```
+
+- **成功标志**：200 + OpenAI 格式回复;`model` 为你 Ollama 拉取的模型名（`ollama list` 里那个）。
+- **404 / 上游路径含 `/v1/v1`**：custom provider 的 Base URL 带了 `/v1`，去掉只留根地址。
+- **502 / 连接超时**：AI Gateway 够不到你的 Ollama 公网地址——检查隧道是否在跑、地址是否对外可访问。
+- **纯本地自测**：只想验证 Ollama 本身，直接打 `http://localhost:11434/v1/chat/completions` 即可，不必过本中继;要的是"统一入口 + AI Gateway 统计"才需要上面这套公网暴露。
+
+> 其它 AI Gateway 支持的 provider（Groq、Mistral、Together、Perplexity 等）同理：存 BYOK key → `provider/model` 无前缀调用即可，本中继与代码都无需改动。
+
+---
+
 ## 怎么判断"通没通"——按报错来源定位
 
 各路由的核心排错思路：**看错误是哪一层发出来的**，就知道卡在哪。
