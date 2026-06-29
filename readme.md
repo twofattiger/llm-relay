@@ -9,6 +9,8 @@
 - **`@cf/` 前缀**：使用 Workers AI 免费额度计价。
 - **`@/` 前缀**：使用 Cloudflare Unified Billing 统一垫付计费，扣除 Credits。
 
+此外，本项目内置 **OpenAI ↔ Anthropic 协议转换**（`src/translate.js`，类 OpenRouter）：当 Anthropic 入口 (`/v1/messages`) 收到一个**非 Claude 模型**时，Worker 会自动把请求体从 Anthropic Messages 格式翻译成 OpenAI Chat Completions 格式发往上游，再把响应（含流式 SSE）翻译回 Anthropic 格式。这样 **Claude Code、Anthropic SDK 等只会说 Anthropic 协议的客户端，也能直接驱动 DeepSeek / Workers AI / GPT 等非 Claude 模型**。
+
 该代理统一隐藏了 Cloudflare 账号凭证和各大模型提供商的 API Key，对外只要求使用一个你自定义的 API Key 进行鉴权，同时完整保留 AI Gateway 的请求日志、用量分析等可观测性功能。
 
 ![后台管理面板主界面](./src/images/main.jpg)
@@ -41,9 +43,21 @@ npx wrangler login
 - `GATEWAY`：你在 Cloudflare AI Gateway 中创建的网关名称
   ![Create AI Gateway](./src/images/create.jpg)
 
-### 4. 注入敏感密钥 (Secrets)
+### 4. 部署到线上
 
-运行以下命令，将密码等敏感信息安全地注入到 Cloudflare。其中 Cloudflare API Token 必须包含 `AI Gateway Run` 和 `Workers AI Read` 权限，权限勾选示例如下：
+执行以下命令将代码和配置发布到 Cloudflare Workers。**必须先部署再注入 secret**：`wrangler secret put` 是把密钥绑定到一个已存在的 Worker 上，Worker 还没创建时注入会失败。
+
+```bash
+npx wrangler deploy
+```
+
+部署完成后，控制台将输出你的 Worker 线上地址（例如：`https://llm-relay.<your-subdomain>.workers.dev`）。此时 Worker 已创建，但密钥尚未注入，下一步补上即可。
+
+> **⚠️ 网络连通性提示：** Cloudflare Workers 默认分配的 `*.workers.dev` 域名在部分地区（如中国大陆）可能存在被墙或网络不稳定的情况。为了确保服务在国内环境下的稳定访问，强烈建议在 Cloudflare Dashboard 中为该 Worker **绑定你自己的自定义域名**。
+
+### 5. 注入敏感密钥 (Secrets)
+
+Worker 部署好后，运行以下命令将密钥等敏感信息安全地注入到 Cloudflare。其中 Cloudflare API Token 必须包含 `AI Gateway Run` 和 `Workers AI Read` 权限，权限勾选示例如下：
 
 ![CF API Token Grant](./src/images/grant.jpg)
 
@@ -59,17 +73,7 @@ npx wrangler secret put ADMIN_PASSWORD
 ```
 *(注：如果需要专门为 Anthropic 补发 key，可按需注入 `ANTHROPIC_API_KEY`，详情见详细文档)*
 
-### 5. 部署到线上
-
-执行以下命令将代码和配置发布到 Cloudflare Workers：
-
-```bash
-npx wrangler deploy
-```
-
-部署完成后，控制台将输出你的 Worker 线上地址（例如：`https://llm-relay.<your-subdomain>.workers.dev`），部署即告完成。
-
-> **⚠️ 网络连通性提示：** Cloudflare Workers 默认分配的 `*.workers.dev` 域名在部分地区（如中国大陆）可能存在被墙或网络不稳定的情况。为了确保服务在国内环境下的稳定访问，强烈建议在 Cloudflare Dashboard 中为该 Worker **绑定你自己的自定义域名**。
+> secret 注入后即时生效，无需再次部署。若注入时提示找不到名为 `llm-relay` 的 Worker，说明上一步部署未成功，请先确认部署完成。
 
 ---
 
