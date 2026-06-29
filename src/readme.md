@@ -547,13 +547,120 @@ print(msg.content)
 
 **Claude Code 接入**:
 
+Claude Code 走 Anthropic 入口(`/v1/messages`)。**注意它除了主模型,还会用一个"小快模型"跑后台任务(生成会话标题、压缩历史等),两个都要指对**,否则后台任务会报错。
+
+基础(用你自己的 Claude,BYOK,原生透传,体验最佳):
+
 ```bash
-export ANTHROPIC_BASE_URL="https://<你的worker>"
-export ANTHROPIC_API_KEY="<MY_API_KEY>"
-# Claude Code 用 x-api-key 把 MY_API_KEY 发给 /v1/messages,默认走无前缀=BYOK
+export ANTHROPIC_BASE_URL="https://<你的worker>"       # 不带 /v1
+export ANTHROPIC_API_KEY="<MY_API_KEY>"               # 以 x-api-key 发出,Worker 已支持
+export ANTHROPIC_MODEL="claude-sonnet-4-5"            # 主模型
+export ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-4-5"  # 后台小任务模型
+# 直接 claude 启动即可;BYOK 不扣 credits,thinking / prompt caching 全可用
 ```
 
-> Anthropic SDK 默认请求 `{base_url}/v1/messages` 并以 `x-api-key` 携带 key,所以 `base_url` 不要再带 `/v1`。
+变体——**统一计费的 Claude**(`@/anthropic/`,扣 credits):
+
+```bash
+export ANTHROPIC_MODEL="@/anthropic/claude-sonnet-4-5"
+export ANTHROPIC_SMALL_FAST_MODEL="@/anthropic/claude-haiku-4-5"
+```
+
+变体——**让 CC 跑非 Claude 模型**(协议转换,如 DeepSeek):
+
+```bash
+export ANTHROPIC_MODEL="deepseek/deepseek-chat"
+export ANTHROPIC_SMALL_FAST_MODEL="deepseek/deepseek-chat"
+# ⚠ 触发协议转换(§1.6),agent 基本可用,但 thinking / prompt caching / citations 不覆盖
+```
+
+不想每次 export,可持久化到 `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://<你的worker>",
+    "ANTHROPIC_API_KEY": "<MY_API_KEY>",
+    "ANTHROPIC_MODEL": "claude-sonnet-4-5",
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4-5"
+  }
+}
+```
+
+> 坑位提醒:
+> - **`ANTHROPIC_BASE_URL` 不要带 `/v1`**:Anthropic SDK 默认请求 `{base_url}/v1/messages`,带了会变 `/v1/v1/...`。
+> - **`ANTHROPIC_SMALL_FAST_MODEL` 指向的模型也必须在 relay 上能调通**(可与主模型走不同路由),否则后台任务报错。
+> - 要 Claude 全能力优先用真 Claude(BYOK 或 `@/anthropic/`),非 Claude 当省钱备选。
+
+---
+
+### 6.6 IDE 接入(Cursor / Trae 等 OpenAI 兼容客户端)
+
+Cursor、Trae 这类 AI IDE 都支持"自定义 OpenAI 兼容端点",所以统一走本中继的 **OpenAI 入口**(`/v1/chat/completions`):
+- **Base URL**:`https://<你的worker>/v1`(结尾带 `/v1`,IDE 会自动接 `/chat/completions`)
+- **API Key**:你的 `MY_API_KEY`
+- **Model**:手动添加,写法与前缀规则一致(`deepseek/deepseek-chat` / `@/openai/gpt-4o` / `@cf/...`)
+
+> ⚠ 通用注意:
+> - 这条路**只支持 OpenAI 格式**(走 `/v1/chat/completions`);要用 Claude 全能力(thinking/agent)请改用 Claude Code 接 Anthropic 入口。
+> - 端点**必须公网可达**:IDE 的"验证/测试连接"和请求多由其**云端服务器**发出,`workers.dev`/自定义域名可以,本地 `wrangler dev` 的 localhost 不行。
+> - IDE 的深度功能(自动补全 Tab、Composer/Agent、Apply 等)很多绑各家自有模型,自定义端点主要保证**对话(Chat)**可用,不保证完全等价。
+
+**Cursor**
+
+1. `Cmd/Ctrl + Shift + J` 打开 Cursor Settings → **Models**。
+2. 在 **OpenAI API Key** 区域填入 `MY_API_KEY`,勾选 **Override OpenAI Base URL** 填 `https://<你的worker>/v1`。
+3. **Add model** 添加你的 model 名(如 `deepseek/deepseek-chat`),关掉用不到的内置模型。
+4. 点 **Verify** 验证;通过后在对话框选该模型即可。
+5. 注意:开启 Override 后通常不能同时用 Cursor 内置 Pro 模型,二选一。
+
+**Trae**
+
+1. 打开设置 → **模型 / Models**(AI 模型管理)→ **添加模型 / 自定义模型**。
+2. 模型服务商选 **OpenAI 兼容 / OpenAI-Compatible**(或"自定义"):
+   - **Base URL / API 地址**:`https://<你的worker>/v1`
+   - **API Key**:`MY_API_KEY`
+   - **模型 ID**:你的 model 名(如 `deepseek/deepseek-chat`、`@/openai/gpt-4o`)
+3. 保存并测试连接,通过后在对话/Builder 里选用该模型。
+
+> 各家 IDE 设置项名称随版本变动,核心三要素不变:**Base URL = `…/v1`、Key = `MY_API_KEY`、Model = 带前缀的模型名**。
+
+**OpenCode**(终端 agent,配置文件驱动)
+
+编辑 `opencode.json`(项目根)或全局 `~/.config/opencode/opencode.json`,加一个 OpenAI 兼容 provider:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "llmrelay": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LLM Relay",
+      "options": {
+        "baseURL": "https://<你的worker>/v1",
+        "apiKey": "{env:LLM_RELAY_KEY}"
+      },
+      "models": {
+        "deepseek/deepseek-chat":          { "name": "DeepSeek (BYOK)" },
+        "@/openai/gpt-4o":                 { "name": "GPT-4o (统一计费)" },
+        "@cf/meta/llama-3.3-70b-instruct": { "name": "Llama 3.3 (Workers AI)" }
+      }
+    }
+  }
+}
+```
+
+然后设好 key 并启动:
+
+```bash
+export LLM_RELAY_KEY="<MY_API_KEY>"
+opencode      # 进入后用 /models 选 LLM Relay 下的模型
+```
+
+- `models` 的 key 就是发给上游的 model 名(前缀规则照旧);完整引用形如 `llmrelay/deepseek/deepseek-chat`。
+- OpenCode 在本机直接请求 `baseURL`,**不经第三方云端**,所以连通性比 Cursor/Trae 宽松。
+- 它是 agent、重度用 tool calling,**请选工具能力强的模型**(`deepseek/deepseek-chat`、`@/openai/gpt-4o` 等)。
+- 不在 models.dev 目录里的模型,可在每个 model 里补 `"limit": {"context": 128000, "output": 8192}` 让上下文管理更准。
 
 ---
 
