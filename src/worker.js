@@ -181,13 +181,9 @@ function resolveOpenAI(model, body, env) {
 }
 
 // ---- Anthropic 入口(/v1/messages)----
+// 只处理 Claude 原生模型(claude-* / @/anthropic/*);非 Claude 模型已在 fetch 里被
+// isAnthropicNative() 拦走、转入 handleAnthropicViaOpenAI 做协议转换,不会到这里。
 function resolveAnthropic(model, body, env) {
-  if (model.startsWith("@cf/")) {
-    return {
-      error: "Workers AI (@cf/) does not support the Anthropic Messages format. Use /v1/chat/completions instead.",
-      status: 400,
-    };
-  }
   if (model.startsWith("@/")) {
     body.model = model.slice(2); // 统一计费,剥前缀 → anthropic/claude-...
     return {

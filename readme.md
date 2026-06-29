@@ -9,6 +9,8 @@
 - **`@cf/` 前缀**：使用 Workers AI 免费额度计价。
 - **`@/` 前缀**：使用 Cloudflare Unified Billing 统一垫付计费，扣除 Credits。
 
+此外，本项目内置 **OpenAI ↔ Anthropic 协议转换**（`src/translate.js`，类 OpenRouter）：当 Anthropic 入口 (`/v1/messages`) 收到一个**非 Claude 模型**时，Worker 会自动把请求体从 Anthropic Messages 格式翻译成 OpenAI Chat Completions 格式发往上游，再把响应（含流式 SSE）翻译回 Anthropic 格式。这样 **Claude Code、Anthropic SDK 等只会说 Anthropic 协议的客户端，也能直接驱动 DeepSeek / Workers AI / GPT 等非 Claude 模型**。
+
 该代理统一隐藏了 Cloudflare 账号凭证和各大模型提供商的 API Key，对外只要求使用一个你自定义的 API Key 进行鉴权，同时完整保留 AI Gateway 的请求日志、用量分析等可观测性功能。
 
 ![后台管理面板主界面](./src/images/main.jpg)

@@ -19,8 +19,11 @@ export KEY="你的_MY_API_KEY"
 | ② | BYOK（OpenAI 格式） | `provider/model` 无前缀 | `/v1/chat/completions` | 你自己的 provider 账户（如 DeepSeek），不扣 CF credits | 已在 Provider Keys 存对应 key；`CF_API_TOKEN` 含 AI Gateway Run |
 | ③ | BYOK（Anthropic 格式） | 裸名 `claude-...` 无前缀 | `/v1/messages` | 你自己的 Anthropic 账户，不扣 CF credits | 已存 Anthropic key；用 `x-api-key` + `anthropic-version` |
 | ④ | Unified Billing | `@/provider/model` | `/v1/chat/completions` 或 `/v1/messages` | Cloudflare 垫付，扣你充的 credits（passthrough 价 + 充值时 5% 手续费） | 已充 credits |
+| ⑤ | 协议转换（类 OpenRouter） | `/v1/messages` 上的**非 Claude** model（如 `deepseek/...`、`@cf/...`、`@/deepseek/...`） | `/v1/messages` | **复用 ①②④ 的计费**（按前缀分流） | 同对应前缀路由的前提；额外做 OpenAI↔Anthropic 转换 |
 
 > 注意区分计费来源：① 是 Workers AI 的 Neuron 体系，④ 是 Unified Billing 的 credits，**两套独立的钱**，不通用。② ③ 都不花 CF 的钱，花的是你在 provider 那边的余额。
+>
+> ⑤ 不是独立计费路由，而是一种**入口能力**：在 Anthropic 入口上发非 Claude 模型时，Worker 自动把 Anthropic 格式转成 OpenAI 格式调上游、再转回——实际计费仍按 model 前缀落到 ①/②/④。验证见下文 ⑤。
 
 ---
 
@@ -75,7 +78,8 @@ curl -i -X POST "$BASE/v1/messages" \
 - **成功标志**：200 + Anthropic 格式 JSON（含 `content` 数组、`stop_reason` 等）。
 - **本项目已验证**：Anthropic BYOK 纯靠 `cf-aig-authorization` 即可注入，**不需要**启用 worker.js 里 `x-api-key` 兜底那行，也不需要配 `ANTHROPIC_API_KEY`。
 - **`anthropic-version: 2023-06-01` 是稳定版本号，不用改**。
-- **`@cf/` 不能走这个入口**：Workers AI 不支持 Anthropic Messages 格式，会被 Worker 拦截返回 400，改用 `/v1/chat/completions`。
+- **裸名 `claude-...` 走原生透传（不转换）**：只有 model 以 `claude` 开头或为 `@/anthropic/...` 时才是这条原生 Anthropic 路由；其它任何 model 都会触发协议转换（见 ⑤）。
+- **`@cf/` 等非 Claude 模型现在也能走这个入口**：经协议转换（⑤）实现，不再返回 400。若客户端本就是 OpenAI 格式，直接用 `/v1/chat/completions` 更省一层转换。
 
 ---
 
@@ -107,9 +111,70 @@ curl -i -X POST "$BASE/v1/messages" \
 
 ---
 
+## ⑤ 协议转换（类 OpenRouter）——Anthropic 入口跑非 Claude 模型
+
+**触发场景（重点）**：在 **Anthropic 入口 `/v1/messages`** 上发一个**非 Claude 模型**（model 既不以 `claude` 开头、也不是 `@/anthropic/...`）。此时 Worker 不再原样透传，而是：Anthropic 请求体 →翻译成 OpenAI 格式 →按 model 前缀复用 ①②④ 的路由调上游 →把 OpenAI 响应（含流式 SSE）翻译回 Anthropic 格式返回。
+
+典型用途：让 **Claude Code / Anthropic SDK** 这类只会说 Anthropic 协议的客户端，直接驱动 DeepSeek / Workers AI / GPT 等非 Claude 模型。
+
+### ⑤-a 非 Claude + 无前缀（→ 复用 ② BYOK）
+
+```bash
+curl -i -X POST "$BASE/v1/messages" \
+  -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"deepseek/deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'
+```
+
+- **成功标志**：200 + **Anthropic 格式** JSON（含 `content` 数组、`stop_reason`、`usage.input_tokens/output_tokens`）——注意你发的是 Anthropic 格式、收到的也是 Anthropic 格式，但**上游跑的是 DeepSeek**。
+- **证明确实转换了**：去 DeepSeek 后台看用量增加（说明打到了 DeepSeek），而响应却是 Anthropic 结构（说明 Worker 转了回来）。AI Gateway → Logs 里上游那条是 OpenAI 格式。
+
+### ⑤-b 非 Claude + `@cf/`（→ 复用 ① Workers AI，旧版不支持，现已打通）
+
+```bash
+curl -i -X POST "$BASE/v1/messages" \
+  -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"@cf/meta/llama-3.2-3b-instruct","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'
+```
+
+- **成功标志**：200 + Anthropic 格式回复（旧版这里会 400，现经协议转换返回正常）。
+- **确认计费**：同 ①，看 Workers AI 的 Neuron 用量增加。
+
+### ⑤-c 流式（验证 SSE 双向事件映射）
+
+```bash
+curl -N -X POST "$BASE/v1/messages" \
+  -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"deepseek/deepseek-v4-flash","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"写一句话"}]}'
+```
+
+- **成功标志**：SSE 流里出现 **Anthropic 风格事件**：`event: message_start` → `content_block_start` → 多个 `content_block_delta`(`text_delta`) → `content_block_stop` → `message_delta` → `message_stop`（而**不是** OpenAI 的 `choices[].delta` chunk）。看到这套事件名就说明流式转换成功。
+
+### ⑤-d 对照：同入口、只换 model 名 = 切换"是否转换"
+
+```bash
+# 原生透传（claude 开头）→ 走你的 Anthropic BYOK，不转换
+curl -s -X POST "$BASE/v1/messages" \
+  -H "x-api-key: $KEY" -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"claude-haiku-4-5","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}' | head -c 200
+echo
+# 协议转换（非 claude）→ 翻译后走 DeepSeek，再转回 Anthropic
+curl -s -X POST "$BASE/v1/messages" \
+  -H "x-api-key: $KEY" -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"deepseek/deepseek-v4-flash","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}' | head -c 200
+```
+
+两条都返回 Anthropic 结构，但上游一个是 Anthropic、一个是 DeepSeek——**同一个客户端、同一个入口，仅靠 model 名是否以 `claude` 开头来切换是否转换**。
+
+> **覆盖边界**：协议转换支持 system / 多轮 messages / 文本图片块 / tools / tool_use / tool_result / tool_choice / stop_reason / usage / 流式。**不覆盖** extended thinking、PDF 文档块、citations、prompt caching——需要这些请改用真正的 Claude 模型走原生透传（③ 或 ④ 的 `@/anthropic/`）。
+
+---
+
 ## 怎么判断"通没通"——按报错来源定位
 
-四条路由的核心排错思路：**看错误是哪一层发出来的**，就知道卡在哪。
+各路由的核心排错思路：**看错误是哪一层发出来的**，就知道卡在哪。
 
 | 报错特征 | 来源层 | 含义 / 处理 |
 |---|---|---|
@@ -119,6 +184,8 @@ curl -i -X POST "$BASE/v1/messages" \
 | `{"type":"error",...,"request_id":"req_..."}` "credit balance is too low" | **上游 provider 本家**（如 Anthropic） | BYOK 已成功注入并打到上游，是 provider 账户没钱；去 provider 充值 |
 | BYOK 路由 401 / gateway 认证失败 | Cloudflare | `CF_API_TOKEN` 缺 **AI Gateway Run** 权限 |
 | `@cf/` 路由 401 / 权限错 | Cloudflare | `CF_API_TOKEN` 缺 **Workers AI Read** 权限 |
+| `/v1/messages` 非 Claude 模型返回 `{"type":"error",...,"message":"Upstream <code>: ..."}` | **协议转换路径（⑤）下的上游** | Worker 已转换并打到上游，但上游报错；按 `<code>` 当成 ①②④ 的对应问题排查（鉴权/credits/模型 ID） |
+| `/v1/messages` 非 Claude 模型返回正常但**缺 thinking / 引用 / 缓存** | 协议转换不覆盖（⑤ 边界） | 这是预期；需要 Claude 全部能力请改用真正的 Claude 模型走原生透传 |
 
 判定要点：**报错来自上游本家（带 provider 的 request_id / 格式），说明 BYOK 注入成功、路由全通**，剩下的是 provider 侧账户问题，与代码无关。报错来自 Worker 或 Cloudflare，才需要回头查鉴权/权限/credits。
 
@@ -126,6 +193,6 @@ curl -i -X POST "$BASE/v1/messages" \
 
 ## 隐私补充：上游看到的 IP
 
-四条路由的上游调用都由 Worker 重新发起连接，**DeepSeek / Anthropic 等 provider 看到的是 Cloudflare 出口 IP，不是你的真实 IP**（你的 IP 在"你→Worker"那一跳就终止）。代码层面 `fwdHeaders` 从零重建，未透传 `cf-connecting-ip` / `x-forwarded-for`，不会泄露本机 IP。
+所有路由（含协议转换 ⑤）的上游调用都由 Worker 重新发起连接，**DeepSeek / Anthropic 等 provider 看到的是 Cloudflare 出口 IP，不是你的真实 IP**（你的 IP 在"你→Worker"那一跳就终止）。代码层面 `fwdHeaders` 从零重建，未透传 `cf-connecting-ip` / `x-forwarded-for`，不会泄露本机 IP。
 
 注意：这只是对**第三方 provider** 隐藏，**Cloudflare 自身可见你的真实 IP**（边缘连接 + AI Gateway 日志均记录）。这是"经 CF 中转"的副产物，不是匿名方案。
