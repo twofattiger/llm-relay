@@ -547,13 +547,50 @@ print(msg.content)
 
 **Claude Code 接入**:
 
+Claude Code 走 Anthropic 入口(`/v1/messages`)。**注意它除了主模型,还会用一个"小快模型"跑后台任务(生成会话标题、压缩历史等),两个都要指对**,否则后台任务会报错。
+
+基础(用你自己的 Claude,BYOK,原生透传,体验最佳):
+
 ```bash
-export ANTHROPIC_BASE_URL="https://<你的worker>"
-export ANTHROPIC_API_KEY="<MY_API_KEY>"
-# Claude Code 用 x-api-key 把 MY_API_KEY 发给 /v1/messages,默认走无前缀=BYOK
+export ANTHROPIC_BASE_URL="https://<你的worker>"       # 不带 /v1
+export ANTHROPIC_API_KEY="<MY_API_KEY>"               # 以 x-api-key 发出,Worker 已支持
+export ANTHROPIC_MODEL="claude-sonnet-4-5"            # 主模型
+export ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-4-5"  # 后台小任务模型
+# 直接 claude 启动即可;BYOK 不扣 credits,thinking / prompt caching 全可用
 ```
 
-> Anthropic SDK 默认请求 `{base_url}/v1/messages` 并以 `x-api-key` 携带 key,所以 `base_url` 不要再带 `/v1`。
+变体——**统一计费的 Claude**(`@/anthropic/`,扣 credits):
+
+```bash
+export ANTHROPIC_MODEL="@/anthropic/claude-sonnet-4-5"
+export ANTHROPIC_SMALL_FAST_MODEL="@/anthropic/claude-haiku-4-5"
+```
+
+变体——**让 CC 跑非 Claude 模型**(协议转换,如 DeepSeek):
+
+```bash
+export ANTHROPIC_MODEL="deepseek/deepseek-chat"
+export ANTHROPIC_SMALL_FAST_MODEL="deepseek/deepseek-chat"
+# ⚠ 触发协议转换(§1.6),agent 基本可用,但 thinking / prompt caching / citations 不覆盖
+```
+
+不想每次 export,可持久化到 `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://<你的worker>",
+    "ANTHROPIC_API_KEY": "<MY_API_KEY>",
+    "ANTHROPIC_MODEL": "claude-sonnet-4-5",
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4-5"
+  }
+}
+```
+
+> 坑位提醒:
+> - **`ANTHROPIC_BASE_URL` 不要带 `/v1`**:Anthropic SDK 默认请求 `{base_url}/v1/messages`,带了会变 `/v1/v1/...`。
+> - **`ANTHROPIC_SMALL_FAST_MODEL` 指向的模型也必须在 relay 上能调通**(可与主模型走不同路由),否则后台任务报错。
+> - 要 Claude 全能力优先用真 Claude(BYOK 或 `@/anthropic/`),非 Claude 当省钱备选。
 
 ---
 
