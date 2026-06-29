@@ -21,6 +21,8 @@
 //                 ② 建议配 LOGIN_GUARD(Durable Object)做登录防爆破。
 //   WORKER_NAME   (面板用)本 Worker 脚本名,查 Worker 用量用;与 wrangler.toml 的 name 一致(llm-relay)
 
+import { isAnthropicNative, anthropicToOpenAI, openAIToAnthropic, streamOpenAIToAnthropic } from "./translate.js";
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -105,6 +107,11 @@ export default {
     const model = body.model;
     if (!model || typeof model !== "string") {
       return json({ error: { message: "Missing 'model'", type: "invalid_request_error" } }, 400);
+    }
+
+    // Anthropic 入口收到非 Claude 模型 → 翻译成 OpenAI 调上游再转回(类 OpenRouter)
+    if (family === "anthropic" && !isAnthropicNative(model)) {
+      return handleAnthropicViaOpenAI(body, env);
     }
 
     // 第二层:按 model 前缀选计费路由
@@ -201,6 +208,51 @@ function cfRestHeaders(env) {
     Authorization: `Bearer ${env.CF_API_TOKEN}`,
     "cf-aig-gateway-id": env.GATEWAY,
   };
+}
+
+// ---- Anthropic 入口收到非 Claude 模型:翻译成 OpenAI 调上游,再转回 Anthropic ----
+async function handleAnthropicViaOpenAI(body, env) {
+  const stream = !!body.stream;
+  const clientModel = body.model; // 回给客户端时保留其请求的 model 名
+  const oai = anthropicToOpenAI(body);
+
+  // 复用 OpenAI 的前缀分流:无前缀=BYOK / @cf/=Workers AI / @/=统一计费
+  const route = resolveOpenAI(oai.model, oai, env);
+  if (route.error) {
+    return json({ type: "error", error: { type: "invalid_request_error", message: route.error } }, route.status || 400);
+  }
+  const fwdHeaders = { "Content-Type": "application/json", ...route.headers };
+
+  let upstream;
+  try {
+    upstream = await fetch(route.url, { method: "POST", headers: fwdHeaders, body: JSON.stringify(oai) });
+  } catch (e) {
+    return json({ type: "error", error: { type: "api_error", message: `Upstream fetch failed: ${e.message}` } }, 502);
+  }
+
+  // 上游错误:转成 Anthropic 风格错误体返回(不污染流)
+  if (!upstream.ok) {
+    const t = await upstream.text();
+    return json({ type: "error", error: { type: "api_error", message: `Upstream ${upstream.status}: ${t.slice(0, 800)}` } }, upstream.status);
+  }
+
+  if (stream) {
+    const out = streamOpenAIToAnthropic(upstream.body, clientModel);
+    const headers = new Headers(CORS_HEADERS);
+    headers.set("Content-Type", "text/event-stream; charset=utf-8");
+    headers.set("Cache-Control", "no-cache");
+    const logId = upstream.headers.get("cf-aig-log-id");
+    if (logId) headers.set("cf-aig-log-id", logId);
+    return new Response(out, { status: 200, headers });
+  }
+
+  let o;
+  try {
+    o = await upstream.json();
+  } catch (e) {
+    return json({ type: "error", error: { type: "api_error", message: `Bad upstream JSON: ${e.message}` } }, 502);
+  }
+  return json(openAIToAnthropic(o, clientModel), 200);
 }
 
 // 恒定时间字符串比较,降低 API key 定时攻击风险
