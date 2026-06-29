@@ -254,25 +254,9 @@ export CLOUDFLARE_ACCOUNT_ID=你的账号ID
 
 > 5.2 这个 token 是**部署用**的(需 Workers Scripts Edit 权限),与运行时的 `CF_API_TOKEN`(AI 权限)是两回事,别混。
 
-### 5.3 写入 secrets
+### 5.3 部署(先部署,再写 secret)
 
-```bash
-npx wrangler secret put MY_API_KEY      # 对外发放的 key
-npx wrangler secret put CF_API_TOKEN    # Cloudflare API token(AI Gateway Run + Workers AI Read)
-# 可选:npx wrangler secret put ANTHROPIC_API_KEY
-
-npx wrangler secret list                # 查看已配置的 secret 名(不显示值)
-```
-
-### 5.4 本地调试
-
-```bash
-npx wrangler dev    # http://localhost:8787
-```
-
-> 本地运行需要那几个 secret 的值。若不想在本地配 secret,直接部署后用线上环境测即可(§5.5);确需本地跑,可临时在 `src/` 下建一个 `.dev.vars`(`MY_API_KEY=...` 等,**勿提交**),`wrangler dev` 会自动读取。
-
-### 5.5 部署
+> **顺序很重要:必须先 `deploy` 再 `secret put`。** `wrangler secret put` 是把密钥绑定到一个**已存在的** Worker 上;Worker 还没创建时注入会失败。先部署把 Worker 建出来(此时几个 secret 还是空的,不影响部署成功),再补 secret。
 
 ```bash
 npx wrangler deploy
@@ -280,6 +264,29 @@ npx wrangler deploy
 ```
 
 > **⚠️ 网络连通性提示：** Cloudflare Workers 默认分配的 `*.workers.dev` 域名在部分地区（如中国大陆）可能存在被墙或网络连通不稳定的情况。为了确保 API 在国内等环境下的稳定调用，**强烈建议在部署完成后，进入 Cloudflare Dashboard 为该 Worker 绑定自己的自定义域名**。
+
+### 5.4 写入 secrets
+
+Worker 部署好后再注入密钥;secret 写入即时生效,无需再次部署。
+
+```bash
+npx wrangler secret put MY_API_KEY      # 对外发放的 key
+npx wrangler secret put CF_API_TOKEN    # Cloudflare API token(AI Gateway Run + Workers AI Read)
+# 可选:npx wrangler secret put ADMIN_PASSWORD   # 启用 /admin 面板
+# 可选:npx wrangler secret put ANTHROPIC_API_KEY
+
+npx wrangler secret list                # 查看已配置的 secret 名(不显示值)
+```
+
+> 若 `secret put` 提示找不到名为 `llm-relay` 的 Worker,说明 §5.3 部署未成功,先把部署跑通再回来注入。
+
+### 5.5 本地调试(可选)
+
+```bash
+npx wrangler dev    # http://localhost:8787
+```
+
+> 本地运行需要那几个 secret 的值。若不想在本地配 secret,直接用线上环境测即可;确需本地跑,可临时在 `src/` 下建一个 `.dev.vars`(`MY_API_KEY=...` 等,**勿提交**),`wrangler dev` 会自动读取。
 
 ### 5.6 查看实时日志
 

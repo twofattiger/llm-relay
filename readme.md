@@ -43,9 +43,21 @@ npx wrangler login
 - `GATEWAY`：你在 Cloudflare AI Gateway 中创建的网关名称
   ![Create AI Gateway](./src/images/create.jpg)
 
-### 4. 注入敏感密钥 (Secrets)
+### 4. 部署到线上
 
-运行以下命令，将密码等敏感信息安全地注入到 Cloudflare。其中 Cloudflare API Token 必须包含 `AI Gateway Run` 和 `Workers AI Read` 权限，权限勾选示例如下：
+执行以下命令将代码和配置发布到 Cloudflare Workers。**必须先部署再注入 secret**：`wrangler secret put` 是把密钥绑定到一个已存在的 Worker 上，Worker 还没创建时注入会失败。
+
+```bash
+npx wrangler deploy
+```
+
+部署完成后，控制台将输出你的 Worker 线上地址（例如：`https://llm-relay.<your-subdomain>.workers.dev`）。此时 Worker 已创建，但密钥尚未注入，下一步补上即可。
+
+> **⚠️ 网络连通性提示：** Cloudflare Workers 默认分配的 `*.workers.dev` 域名在部分地区（如中国大陆）可能存在被墙或网络不稳定的情况。为了确保服务在国内环境下的稳定访问，强烈建议在 Cloudflare Dashboard 中为该 Worker **绑定你自己的自定义域名**。
+
+### 5. 注入敏感密钥 (Secrets)
+
+Worker 部署好后，运行以下命令将密钥等敏感信息安全地注入到 Cloudflare。其中 Cloudflare API Token 必须包含 `AI Gateway Run` 和 `Workers AI Read` 权限，权限勾选示例如下：
 
 ![CF API Token Grant](./src/images/grant.jpg)
 
@@ -61,17 +73,7 @@ npx wrangler secret put ADMIN_PASSWORD
 ```
 *(注：如果需要专门为 Anthropic 补发 key，可按需注入 `ANTHROPIC_API_KEY`，详情见详细文档)*
 
-### 5. 部署到线上
-
-执行以下命令将代码和配置发布到 Cloudflare Workers：
-
-```bash
-npx wrangler deploy
-```
-
-部署完成后，控制台将输出你的 Worker 线上地址（例如：`https://llm-relay.<your-subdomain>.workers.dev`），部署即告完成。
-
-> **⚠️ 网络连通性提示：** Cloudflare Workers 默认分配的 `*.workers.dev` 域名在部分地区（如中国大陆）可能存在被墙或网络不稳定的情况。为了确保服务在国内环境下的稳定访问，强烈建议在 Cloudflare Dashboard 中为该 Worker **绑定你自己的自定义域名**。
+> secret 注入后即时生效，无需再次部署。若注入时提示找不到名为 `llm-relay` 的 Worker，说明上一步部署未成功，请先确认部署完成。
 
 ---
 
