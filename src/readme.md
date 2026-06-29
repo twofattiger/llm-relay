@@ -557,6 +557,39 @@ export ANTHROPIC_API_KEY="<MY_API_KEY>"
 
 ---
 
+### 6.6 IDE 接入(Cursor / Trae 等 OpenAI 兼容客户端)
+
+Cursor、Trae 这类 AI IDE 都支持"自定义 OpenAI 兼容端点",所以统一走本中继的 **OpenAI 入口**(`/v1/chat/completions`):
+- **Base URL**:`https://<你的worker>/v1`(结尾带 `/v1`,IDE 会自动接 `/chat/completions`)
+- **API Key**:你的 `MY_API_KEY`
+- **Model**:手动添加,写法与前缀规则一致(`deepseek/deepseek-chat` / `@/openai/gpt-4o` / `@cf/...`)
+
+> ⚠ 通用注意:
+> - 这条路**只支持 OpenAI 格式**(走 `/v1/chat/completions`);要用 Claude 全能力(thinking/agent)请改用 Claude Code 接 Anthropic 入口。
+> - 端点**必须公网可达**:IDE 的"验证/测试连接"和请求多由其**云端服务器**发出,`workers.dev`/自定义域名可以,本地 `wrangler dev` 的 localhost 不行。
+> - IDE 的深度功能(自动补全 Tab、Composer/Agent、Apply 等)很多绑各家自有模型,自定义端点主要保证**对话(Chat)**可用,不保证完全等价。
+
+**Cursor**
+
+1. `Cmd/Ctrl + Shift + J` 打开 Cursor Settings → **Models**。
+2. 在 **OpenAI API Key** 区域填入 `MY_API_KEY`,勾选 **Override OpenAI Base URL** 填 `https://<你的worker>/v1`。
+3. **Add model** 添加你的 model 名(如 `deepseek/deepseek-chat`),关掉用不到的内置模型。
+4. 点 **Verify** 验证;通过后在对话框选该模型即可。
+5. 注意:开启 Override 后通常不能同时用 Cursor 内置 Pro 模型,二选一。
+
+**Trae**
+
+1. 打开设置 → **模型 / Models**(AI 模型管理)→ **添加模型 / 自定义模型**。
+2. 模型服务商选 **OpenAI 兼容 / OpenAI-Compatible**(或"自定义"):
+   - **Base URL / API 地址**:`https://<你的worker>/v1`
+   - **API Key**:`MY_API_KEY`
+   - **模型 ID**:你的 model 名(如 `deepseek/deepseek-chat`、`@/openai/gpt-4o`)
+3. 保存并测试连接,通过后在对话/Builder 里选用该模型。
+
+> 各家 IDE 设置项名称随版本变动,核心三要素不变:**Base URL = `…/v1`、Key = `MY_API_KEY`、Model = 带前缀的模型名**。
+
+---
+
 ## 7. 排错对照表
 
 | 现象 | 原因 | 处理 |
