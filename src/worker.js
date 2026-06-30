@@ -588,38 +588,47 @@ async function handleAdminKeyDelete(req, env) {
 // ============================================================
 const BUILD_EXAMPLES_JS = `function buildExamples(origin, key, m) {
   var b = origin;
-  var m1 = m || "@cf/meta/llama-3.2-3b-instruct";
-  var m2 = m || "deepseek/deepseek-chat";
-  var m3 = m || "claude-haiku-4-5";
-  var m4 = m || "@/deepseek/deepseek-chat";
-  var m5 = m || "claude-sonnet-4-5";
-  return [
-    "# ① Workers AI(@cf/,免费额度)",
-    "curl " + b + "/v1/chat/completions -H 'Authorization: Bearer " + key + "' \\\\",
-    "  -d '{\\"model\\":\\"" + m1 + "\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'",
-    "",
-    "# ② BYOK(无前缀,用你自己的 provider key)",
-    "curl " + b + "/v1/chat/completions -H 'Authorization: Bearer " + key + "' \\\\",
-    "  -d '{\\"model\\":\\"" + m2 + "\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'",
-    "",
-    "# ③ Anthropic BYOK(/v1/messages,用 x-api-key)",
-    "curl " + b + "/v1/messages -H 'x-api-key: " + key + "' -H 'anthropic-version: 2023-06-01' \\\\",
-    "  -d '{\\"model\\":\\"" + m3 + "\\",\\"max_tokens\\":64,\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'",
-    "",
-    "# ④ 统一计费(@/,扣 credits)",
-    "curl " + b + "/v1/chat/completions -H 'Authorization: Bearer " + key + "' \\\\",
-    "  -d '{\\"model\\":\\"" + m4 + "\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'",
+  var selM = m || "@cf/meta/llama-3.2-3b-instruct";
+  var curlParts = [];
+
+  if (selM.indexOf("@cf/") === 0) {
+    curlParts = [
+      "# Workers AI(@cf/,免费额度)",
+      "curl " + b + "/v1/chat/completions -H 'Authorization: Bearer " + key + "' \\\\",
+      "  -d '{\\"model\\":\\"" + selM + "\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'"
+    ];
+  } else if (selM.indexOf("@/") === 0) {
+    curlParts = [
+      "# 统一计费(@/,扣 credits)",
+      "curl " + b + "/v1/chat/completions -H 'Authorization: Bearer " + key + "' \\\\",
+      "  -d '{\\"model\\":\\"" + selM + "\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'"
+    ];
+  } else if (selM.indexOf("claude-") === 0) {
+    curlParts = [
+      "# Anthropic BYOK(/v1/messages,用 x-api-key)",
+      "curl " + b + "/v1/messages -H 'x-api-key: " + key + "' -H 'anthropic-version: 2023-06-01' \\\\",
+      "  -d '{\\"model\\":\\"" + selM + "\\",\\"max_tokens\\":64,\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'"
+    ];
+  } else {
+    curlParts = [
+      "# BYOK(无前缀,用你自己的 provider key)",
+      "curl " + b + "/v1/chat/completions -H 'Authorization: Bearer " + key + "' \\\\",
+      "  -d '{\\"model\\":\\"" + selM + "\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'"
+    ];
+  }
+
+  return curlParts.concat([
     "",
     "# ===== Cursor(Settings → Models → OpenAI API Key)=====",
     "#   API Key:           " + key,
     "#   Override Base URL: " + b + "/v1",
-    "#   Add model:         " + m2 + "  /  @/openai/gpt-4o  /  @cf/meta/llama-3.3-70b-instruct",
+    "#   Add model:         " + selM + "  /  @/openai/gpt-4o  /  @cf/meta/llama-3.3-70b-instruct",
     "#   只支持 OpenAI 格式;开启 Override 后与内置 Pro 模型二选一。",
     "",
     "# ===== Claude Code(环境变量)=====",
     "export ANTHROPIC_BASE_URL=\\"" + b + "\\"            # 不带 /v1",
     "export ANTHROPIC_API_KEY=\\"" + key + "\\"",
-    "export ANTHROPIC_MODEL=\\"" + m5 + "\\"            # 主模型(非 Claude 也行,如 deepseek/deepseek-chat)",
+    "export ANTHROPIC_MODEL=\\"" + selM + "\\"            # 主模型(非 Claude 也行,如 deepseek/deepseek-chat)",
     "export ANTHROPIC_SMALL_FAST_MODEL=\\"claude-haiku-4-5\\"  # 后台小任务模型,必须也可调通",
     "",
     "# ===== OpenCode(opencode.json)=====",
@@ -630,14 +639,14 @@ const BUILD_EXAMPLES_JS = `function buildExamples(origin, key, m) {
     "      \\"name\\": \\"LLM Relay\\",",
     "      \\"options\\": { \\"baseURL\\": \\"" + b + "/v1\\", \\"apiKey\\": \\"" + key + "\\" },",
     "      \\"models\\": {",
-    "        \\"" + m2 + "\\": {},",
+    "        \\"" + selM + "\\": {},",
     "        \\"@/openai/gpt-4o\\": {},",
     "        \\"@cf/meta/llama-3.3-70b-instruct\\": {}",
     "      }",
     "    }",
     "  }",
     "}"
-  ].join("\\n");
+  ]).join("\\n");
 }`;
 
 function escapeHtml(s) {
@@ -699,7 +708,6 @@ function userKeyPageHtml(origin, key, env) {
   <h2>示例</h2>
   <div style="flex:1"></div>
   <select id="modelSel">
-    <option value="">默认模型</option>
   </select>
 </div>
 <pre id="ex"></pre>
@@ -805,7 +813,6 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   <div class="row" style="margin-bottom:8px;">
     <div style="flex:1"></div>
     <select id="adminModelSel" class="hide">
-      <option value="">默认模型</option>
     </select>
   </div>
   <pre id="examples"></pre>
@@ -834,7 +841,7 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
       adminExamplesData = d;
       var sel=$("adminModelSel");
       if(d.models && d.models.length>0){
-        sel.innerHTML='<option value="">默认模型</option>';
+        sel.innerHTML='';
         for(var i=0;i<d.models.length;i++){
           var opt=document.createElement('option');
           opt.value=d.models[i]; opt.textContent=d.models[i];
