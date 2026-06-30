@@ -217,13 +217,49 @@ curl -i -X POST "$BASE/v1/chat/completions" \
 
 ---
 
+## 动态 API Key 验证（面板签发 + 公用 DO）
+
+前提：已配 `ADMIN_PASSWORD` 并绑定 `RELAY_DO`（随 `wrangler deploy` 自动创建，无需手动建命名空间）。对外 key 有两类，校验顺序 **master → isolate 缓存 → DO**：
+
+- **`MY_API_KEY`（master）**：始终有效、不经 DO，吊销/变更即时（改 secret）。
+- **动态 key**：`/admin` 面板"API Key 管理"里签发，带名称/有效期，存 DO `api_keys` 表。
+
+### 在面板签发后验证
+
+登录 `/admin` → 新建一把 key（如名称 `test`、有效期 7 天）→ 复制得到 `sk-relay-...`，然后：
+
+```bash
+export DK="sk-relay-...刚签发的"
+curl -i -X POST "$BASE/v1/chat/completions" \
+  -H "Authorization: Bearer $DK" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"你好"}]}'
+```
+
+- **成功标志**：200，和用 `MY_API_KEY` 一样能调通——证明动态 key 已写入 DO 且校验放行。
+- **新建即时可用**：只缓存"通过"结果，新 key 不受缓存影响，签发后马上能用。
+
+### 禁用/删除的生效窗口（关键）
+
+在面板把这把 key **禁用或删除**后，立刻再发上面的请求：
+
+- **可能仍返回 200，最多约 60s**——这是热路径 isolate 缓存（`KEY_CACHE_TTL_MS` 默认 60s）造成的预期滞后，等约 1 分钟后会变 401。
+- 要**即时失效**：用 `MY_API_KEY`（master 不经缓存），或把 `worker.js` 的 `KEY_CACHE_TTL_MS` 调小后重新部署。
+
+### 有效期到期
+
+到期后该 key 自动失效返回 401（DO 按 `expires_at` 判，缓存也不会续命）。可在面板把有效期改长再试。
+
+> **DO 未绑定时**：面板"API Key 管理"会提示「DO 未绑定(RELAY_DO)」，此时只有 `MY_API_KEY` 可用、登录防爆破跳过。检查 `wrangler.toml` 的 `RelayStore` 绑定与迁移、重新 `deploy`。
+
+---
+
 ## 怎么判断"通没通"——按报错来源定位
 
 各路由的核心排错思路：**看错误是哪一层发出来的**，就知道卡在哪。
 
 | 报错特征 | 来源层 | 含义 / 处理 |
 |---|---|---|
-| Worker 返回 `{"error":{"type":"authentication_error"}}` 401 | **Worker 本身** | 你的 `MY_API_KEY` 没对上；检查 `Authorization`/`x-api-key` 是否带对 |
+| Worker 返回 `{"error":{"type":"authentication_error"}}` 401 | **Worker 本身** | key 没对上：检查 `Authorization`/`x-api-key`；动态 key 可能已禁用/过期/删除（删除后还能用最多 ~60s 是缓存所致） |
 | `{"errors":[{"code":2021,...}]}` "add money to your gateway" | **Cloudflare AI Gateway** | ④ 统一计费没 credits；充值或改走 BYOK |
 | 410 + "Model has been deprecated" | **Workers AI** | ① 模型 ID 下线，换有效 `@cf/...` ID |
 | `{"type":"error",...,"request_id":"req_..."}` "credit balance is too low" | **上游 provider 本家**（如 Anthropic） | BYOK 已成功注入并打到上游，是 provider 账户没钱；去 provider 充值 |

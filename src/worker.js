@@ -5,8 +5,12 @@
 // 每个入口再按 model 前缀分流:无前缀=BYOK / @cf/=Workers AI / @/=统一计费
 //
 // 环境变量说明:
-//   MY_API_KEY    对外鉴权用的自有 key;客户端用 `Authorization: Bearer` 或 `x-api-key` 携带
-//                 (OpenAI SDK 用前者,Anthropic SDK / Claude Code 用后者)
+//   MY_API_KEY    对外的 master/兜底 key,始终有效、不依赖 DO;客户端用 `Authorization: Bearer`
+//                 或 `x-api-key` 携带(OpenAI SDK 用前者,Anthropic SDK / Claude Code 用后者)。
+//   RELAY_DO      (Durable Object 绑定,SQLite)公用存储,单实例 idFromName("relay")。一个 DO
+//                 里建多张表:动态对外 key(api_keys)、登录防爆破(login_guard)、预留用量计数
+//                 (usage_counters,将来配额用)。key 校验先查 isolate 内存缓存,未命中再问 DO。
+//                 不绑定 RELAY_DO 时:仅 MY_API_KEY 可用、面板 Key 管理不可用、登录防爆破跳过。
 //   CF_API_TOKEN  唯一的 Cloudflare API token,同时用于:
 //                   - cf-aig-authorization(BYOK 路由,gateway.ai.cloudflare.com)→ 需 AI Gateway Run
 //                   - Authorization Bearer(REST 路由,api.cloudflare.com/.../ai/*:@cf/ 和 @/)→ 需 Workers AI Read
@@ -18,7 +22,7 @@
 //   ADMIN_PASSWORD (可选)登录管理面板 /admin 的密码,与 MY_API_KEY 完全分开。配了它才启用面板。
 //                 HMAC 会话签名也用它(改密码即令旧会话失效)。启用面板还需:
 //                 ① 给 CF_API_TOKEN 补【Account Analytics Read】只读权限(查 GraphQL 统计);
-//                 ② 建议配 LOGIN_GUARD(Durable Object)做登录防爆破。
+//                 ② 登录防爆破与动态 key 都走 RELAY_DO(同一个 DO)。
 //   WORKER_NAME   (面板用)本 Worker 脚本名,查 Worker 用量用;与 wrangler.toml 的 name 一致(llm-relay)
 
 import { isAnthropicNative, anthropicToOpenAI, openAIToAnthropic, streamOpenAIToAnthropic } from "./translate.js";
@@ -45,7 +49,7 @@ const PASSTHROUGH_HEADERS = [
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 
 // 管理面板:登录防爆破 + 会话
-const ADMIN_MAX_FAILS = 5; // 窗口内最大失败次数(需配 LOGIN_GUARD DO 才生效)
+const ADMIN_MAX_FAILS = 5; // 窗口内最大失败次数(需配 RELAY_DO 才生效)
 const ADMIN_WINDOW_MS = 10 * 60 * 1000; // 失败计数窗口:10 分钟
 const ADMIN_LOCK_MS = 15 * 60 * 1000; // 触发后锁定时长:15 分钟
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 登录会话有效期:12 小时
@@ -70,19 +74,22 @@ export default {
       if (p === "/admin/login") return handleAdminLogin(req, env);
       if (p === "/admin/logout") return handleAdminLogout();
       if (p === "/admin/api/stats") return handleAdminStats(req, env);
+      if (p === "/admin/api/keys") return handleAdminKeys(req, env); // GET=列出 POST=新建
+      if (p === "/admin/api/keys/update") return handleAdminKeyUpdate(req, env);
+      if (p === "/admin/api/keys/delete") return handleAdminKeyDelete(req, env);
     }
 
     if (req.method !== "POST") {
       return json({ error: { message: "Method not allowed", type: "invalid_request_error" } }, 405);
     }
 
-    // 自有 API key 鉴权
+    // 对外 key 鉴权
     // 同时接受 Authorization: Bearer <key>(OpenAI SDK)和 x-api-key: <key>(Anthropic SDK / Claude Code)
     const token =
       (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") ||
       req.headers.get("x-api-key") ||
       "";
-    if (!safeEqual(token, env.MY_API_KEY)) {
+    if (!(await authClient(token, env))) {
       return json({ error: { message: "Unauthorized", type: "authentication_error" } }, 401);
     }
 
@@ -247,6 +254,46 @@ async function handleAnthropicViaOpenAI(body, env) {
   return json(openAIToAnthropic(o, clientModel), 200);
 }
 
+// 取公用 DO 的固定单实例(所有 key/登录/计数都在这一个里)
+function relayStub(env) {
+  return env.RELAY_DO.get(env.RELAY_DO.idFromName("relay"));
+}
+
+// isolate 级缓存:已校验通过的 token → 该缓存项的过期时间戳(ms)。
+// 只缓存"通过"的结果(新建 key 即时可用);吊销/过期最多滞后 KEY_CACHE_TTL_MS 生效。
+const keyCache = new Map();
+const KEY_CACHE_TTL_MS = 60 * 1000;
+
+// 对外 key 校验:master 恒定时间比对 → isolate 缓存 → 问 DO
+async function authClient(token, env) {
+  if (!token) return false;
+  if (env.MY_API_KEY && safeEqual(token, env.MY_API_KEY)) return true;
+  if (!env.RELAY_DO) return false;
+
+  const now = Date.now();
+  const hit = keyCache.get(token);
+  if (hit && hit > now) return true;
+
+  try {
+    const r = await relayStub(env).fetch("https://do/keys/validate", {
+      method: "POST",
+      body: JSON.stringify({ key: token }),
+    });
+    const d = await r.json();
+    if (d.valid) {
+      // 缓存到 min(TTL, key 自身到期),避免缓存把已过期的 key 续命
+      let exp = now + KEY_CACHE_TTL_MS;
+      if (d.rec && d.rec.expiresAt) exp = Math.min(exp, d.rec.expiresAt);
+      keyCache.set(token, exp);
+      return true;
+    }
+  } catch {
+    // DO 故障:master 仍可用,动态 key 此刻不放行(fail-closed)
+  }
+  keyCache.delete(token);
+  return false;
+}
+
 // 恒定时间字符串比较,降低 API key 定时攻击风险
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
@@ -310,13 +357,12 @@ async function handleAdminLogin(req, env) {
   const pw = typeof body.password === "string" ? body.password : "";
   const ok = safeEqual(pw, env.ADMIN_PASSWORD);
 
-  // 登录防爆破:按 IP,需配 LOGIN_GUARD(Durable Object)
-  if (env.LOGIN_GUARD) {
+  // 登录防爆破:按 IP,走公用 RELAY_DO 的 login_guard 表
+  if (env.RELAY_DO) {
     const ip = req.headers.get("cf-connecting-ip") || "unknown";
-    const stub = env.LOGIN_GUARD.get(env.LOGIN_GUARD.idFromName(ip));
     let verdict;
     try {
-      const gr = await stub.fetch("https://guard/record", { method: "POST", body: JSON.stringify({ ok }) });
+      const gr = await relayStub(env).fetch("https://do/login/record", { method: "POST", body: JSON.stringify({ ip, ok }) });
       verdict = await gr.json();
     } catch {
       verdict = { locked: false }; // 守卫故障不连带锁死;要 fail-closed 可改 locked:true
@@ -434,6 +480,55 @@ async function handleAdminStats(req, env) {
   });
 }
 
+// ============================================================
+// 动态对外 API key 管理:Worker 只做鉴权 + 转调公用 RELAY_DO(SQLite)。需有效会话。
+// ============================================================
+
+// GET /admin/api/keys → 列出;POST /admin/api/keys → 新建
+async function handleAdminKeys(req, env) {
+  if (!(await verifySession(req, env))) return json({ error: "Unauthorized" }, 401);
+  if (req.method === "POST") return handleAdminKeyCreate(req, env);
+  if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
+  if (!env.RELAY_DO) return json({ error: "DO 未绑定(RELAY_DO),见 wrangler.toml" }, 501);
+  const r = await relayStub(env).fetch("https://do/keys/list", { method: "POST", body: "{}" });
+  return json(await r.json());
+}
+
+async function handleAdminKeyCreate(req, env) {
+  if (!env.RELAY_DO) return json({ error: "DO 未绑定(RELAY_DO),见 wrangler.toml" }, 501);
+  let b;
+  try { b = await req.json(); } catch { b = {}; }
+  const r = await relayStub(env).fetch("https://do/keys/create", { method: "POST", body: JSON.stringify(b) });
+  const d = await r.json();
+  return json(d, d.error ? 409 : 200);
+}
+
+// POST /admin/api/keys/update  { key, name?, disabled?, ttlDays? }
+async function handleAdminKeyUpdate(req, env) {
+  if (!(await verifySession(req, env))) return json({ error: "Unauthorized" }, 401);
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  if (!env.RELAY_DO) return json({ error: "DO 未绑定(RELAY_DO)" }, 501);
+  let b;
+  try { b = await req.json(); } catch { b = {}; }
+  const r = await relayStub(env).fetch("https://do/keys/update", { method: "POST", body: JSON.stringify(b) });
+  const d = await r.json();
+  if (b.key) keyCache.delete(b.key); // 同 isolate 即时失效(其它 isolate 至多 TTL 后)
+  return json(d, d.error ? 400 : 200);
+}
+
+// POST /admin/api/keys/delete  { key }
+async function handleAdminKeyDelete(req, env) {
+  if (!(await verifySession(req, env))) return json({ error: "Unauthorized" }, 401);
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  if (!env.RELAY_DO) return json({ error: "DO 未绑定(RELAY_DO)" }, 501);
+  let b;
+  try { b = await req.json(); } catch { b = {}; }
+  const r = await relayStub(env).fetch("https://do/keys/delete", { method: "POST", body: JSON.stringify(b) });
+  const d = await r.json();
+  if (b.key) keyCache.delete(b.key);
+  return json(d);
+}
+
 const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>llm-relay 面板</title>
@@ -452,6 +547,10 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   pre{background:#f7f7f7;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
   .hide{display:none} #login{max-width:320px;margin:60px auto;text-align:center}
   #login input{width:100%;margin:8px 0}
+  button.mini{padding:3px 8px;font-size:12px;border-radius:6px}
+  code.kk{font-size:12px;background:#f3f3f3;padding:2px 5px;border-radius:5px;word-break:break-all}
+  .pill{font-size:12px;padding:1px 7px;border-radius:999px}
+  .pill.on{background:#e6f4ea;color:#137333} .pill.off{background:#fce8e6;color:#c5221f}
 </style></head><body>
 
 <div id="login" class="hide">
@@ -480,6 +579,23 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   <h2>AI Gateway 用量(按模型)</h2>
   <table id="gtbl"><thead><tr><th>Model</th><th>Provider</th><th class="n">请求数</th></tr></thead><tbody></tbody></table>
   <div class="meta" id="gmeta"></div>
+
+  <h2>API Key 管理</h2>
+  <div class="row">
+    <input id="kname" placeholder="名称(可选,如 我的笔记本)" style="flex:1;min-width:160px">
+    <select id="kttl">
+      <option value="0">永不过期</option>
+      <option value="7">7 天</option>
+      <option value="30">30 天</option>
+      <option value="90">90 天</option>
+      <option value="365">365 天</option>
+    </select>
+    <button id="kcreate">新建 Key</button>
+  </div>
+  <div class="err" id="kerr"></div>
+  <table id="ktbl"><thead><tr><th>名称</th><th>Key</th><th>创建</th><th>到期</th><th>状态</th><th>操作</th></tr></thead><tbody></tbody></table>
+  <div class="meta" id="kmeta"></div>
+  <div class="meta">动态 key 存在公用 DO(SQLite),另有一个 <code class="kk">MY_API_KEY</code>(master)始终有效、不在此列。吊销/改有效期最多约 1 分钟后全网生效(isolate 缓存)。配额/次数限制待后续。</div>
 
   <h2>请求示例</h2>
   <pre id="examples"></pre>
@@ -529,8 +645,52 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   }
   function card(v,l){return "<div class=card><div class=v>"+v+"</div><div class=l>"+l+"</div></div>";}
 
+  function fmtTs(ts){return new Date(ts).toISOString().slice(0,16).replace("T"," ");}
+  async function loadKeys(){
+    $("kerr").textContent="";
+    try{
+      var r=await fetch("/admin/api/keys",{credentials:"same-origin"});
+      if(r.status===401){enterLogin();return;}
+      var d=await r.json();
+      if(!r.ok)throw new Error(d.error||("HTTP "+r.status));
+      var tb=$("ktbl").querySelector("tbody"); tb.innerHTML="";
+      var now=Date.now();
+      (d.keys||[]).forEach(function(k){
+        var expired=k.expiresAt&&k.expiresAt<now;
+        var stat=k.disabled?"<span class='pill off'>已禁用</span>":(expired?"<span class='pill off'>已过期</span>":"<span class='pill on'>启用</span>");
+        var tr=document.createElement("tr");
+        tr.innerHTML=
+          "<td>"+esc(k.name||"-")+"</td>"+
+          "<td><code class=kk>"+esc(k.key)+"</code> <button class='ghost mini' data-copy='"+esc(k.key)+"'>复制</button></td>"+
+          "<td>"+(k.createdAt?fmtTs(k.createdAt):"-")+"</td>"+
+          "<td>"+(k.expiresAt?fmtTs(k.expiresAt):"永不")+"</td>"+
+          "<td>"+stat+"</td>"+
+          "<td><button class='ghost mini' data-toggle='"+esc(k.key)+"' data-dis='"+(k.disabled?"0":"1")+"'>"+(k.disabled?"启用":"禁用")+"</button> "+
+          "<button class='ghost mini' data-del='"+esc(k.key)+"'>删除</button></td>";
+        tb.appendChild(tr);
+      });
+      $("kmeta").textContent=(d.keys&&d.keys.length)?("共 "+d.keys.length+" 个"):"暂无动态 key";
+    }catch(e){$("kerr").textContent="加载失败:"+e.message;}
+  }
+  async function createKey(){
+    $("kerr").textContent=""; $("kcreate").disabled=true;
+    try{
+      var r=await fetch("/admin/api/keys",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:$("kname").value,ttlDays:Number($("kttl").value)})});
+      var d=await r.json();
+      if(!r.ok)throw new Error(d.error||("HTTP "+r.status));
+      $("kname").value=""; loadKeys();
+    }catch(e){$("kerr").textContent="创建失败:"+e.message;}
+    finally{$("kcreate").disabled=false;}
+  }
+  async function keyAction(url,payload){
+    var r=await fetch(url,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    if(r.status===401){enterLogin();return;}
+    if(!r.ok){var d=await r.json().catch(function(){return {};});$("kerr").textContent="操作失败:"+(d.error||r.status);return;}
+    loadKeys();
+  }
+
   function enterLogin(){show($("dash"),false);show($("login"),true);$("pw").focus();}
-  function enterDash(){show($("login"),false);show($("dash"),true);fillExamples();loadStats();}
+  function enterDash(){show($("login"),false);show($("dash"),true);fillExamples();loadStats();loadKeys();}
 
   async function doLogin(){
     var pw=$("pw").value; if(!pw){$("loginErr").textContent="请输入密码";return;}
@@ -550,6 +710,20 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   $("hours").onchange=loadStats;
   $("logout").onclick=async function(){await fetch("/admin/logout",{method:"POST",credentials:"same-origin"});enterLogin();};
 
+  $("kcreate").onclick=createKey;
+  $("ktbl").addEventListener("click",function(e){
+    var t=e.target; if(t.tagName!=="BUTTON")return;
+    if(t.dataset.copy!=null){
+      var v=t.dataset.copy;
+      if(navigator.clipboard)navigator.clipboard.writeText(v);
+      var old=t.textContent;t.textContent="已复制";setTimeout(function(){t.textContent=old;},1000);
+    }else if(t.dataset.toggle!=null){
+      keyAction("/admin/api/keys/update",{key:t.dataset.toggle,disabled:t.dataset.dis==="1"});
+    }else if(t.dataset.del!=null){
+      if(confirm("删除该 key？此操作不可恢复。"))keyAction("/admin/api/keys/delete",{key:t.dataset.del});
+    }
+  });
+
   // 启动:用 stats 探测是否已有会话
   (async function(){
     try{
@@ -559,44 +733,138 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   })();
 </script></body></html>`;
 
-// ============================================================
-// LoginGuard:按 IP 的登录爆破防护(Durable Object,强一致)
-// 单次调用判定:传入本次尝试成功/失败,返回是否处于锁定态。
-//   - 成功:清空该 IP 计数。
-//   - 失败:窗口内累加;达到 ADMIN_MAX_FAILS 即锁定 ADMIN_LOCK_MS。
-//   - 锁定期内任何尝试(即使密码正确)都返回 locked,直到锁定到期。
-// 用 SQLite 版 DO(免费档可用),storage 惰性过期,无需 alarm。
-// ============================================================
-export class LoginGuard {
-  constructor(state) {
-    this.state = state;
-  }
-  async fetch(request) {
-    const body = await request.json().catch(() => ({ ok: false }));
-    const ok = !!body.ok;
-    const now = Date.now();
-    const s = (await this.state.storage.get("s")) || { fails: 0, windowStart: now, lockUntil: 0 };
+// 生成随机对外 key:sk-relay-<48 hex>
+function genKey() {
+  const b = crypto.getRandomValues(new Uint8Array(24));
+  let hex = "";
+  for (const x of b) hex += x.toString(16).padStart(2, "0");
+  return "sk-relay-" + hex;
+}
 
-    if (s.lockUntil > now) {
-      return Response.json({ locked: true, retryAfter: Math.ceil((s.lockUntil - now) / 1000) });
+// api_keys 行 → 对外结构(给缓存判过期 / 面板展示)
+function rowToRec(r) {
+  return {
+    name: r.name || "",
+    createdAt: r.created_at,
+    expiresAt: r.expires_at,
+    disabled: !!r.disabled,
+    allowedModels: r.allowed_models ? JSON.parse(r.allowed_models) : null,
+    limits: r.limits ? JSON.parse(r.limits) : null,
+  };
+}
+
+// ============================================================
+// RelayStore:llm-relay 的公用存储(Durable Object,SQLite,单实例 idFromName("relay"))
+// 一个 DO 内多张表,强一致:
+//   api_keys       动态对外 key + 元数据(名称/有效期/禁用/预留 allowed_models、limits)
+//   login_guard    按 IP 的登录爆破防护(原 LoginGuard,改成一张表)
+//   usage_counters 预留:按 key 的用量计数(将来配额用,原子自增;当前未在热路径计数)
+// 通过内部 fetch 调用:/keys/validate /keys/list /keys/create /keys/update /keys/delete /login/record
+// sql.exec 同步执行,故各 op 为同步方法。
+// ============================================================
+export class RelayStore {
+  constructor(state) {
+    this.sql = state.storage.sql;
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS api_keys(key TEXT PRIMARY KEY, name TEXT, created_at INTEGER, expires_at INTEGER, disabled INTEGER DEFAULT 0, allowed_models TEXT, limits TEXT)"
+    );
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS login_guard(ip TEXT PRIMARY KEY, fails INTEGER DEFAULT 0, window_start INTEGER, lock_until INTEGER DEFAULT 0)"
+    );
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS usage_counters(key TEXT, day TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(key, day))"
+    );
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const b = await request.json().catch(() => ({}));
+    switch (url.pathname) {
+      case "/keys/validate": return Response.json(this.validateKey(b.key));
+      case "/keys/list": return Response.json({ keys: this.listKeys() });
+      case "/keys/create": return Response.json(this.createKey(b));
+      case "/keys/update": return Response.json(this.updateKey(b));
+      case "/keys/delete": return Response.json(this.deleteKey(b));
+      case "/login/record": return Response.json(this.loginRecord(b));
+      default: return new Response("not found", { status: 404 });
     }
+  }
+
+  validateKey(key) {
+    if (!key) return { valid: false };
+    const row = this.sql.exec("SELECT * FROM api_keys WHERE key=?", key).toArray()[0];
+    if (!row || row.disabled) return { valid: false };
+    if (row.expires_at && row.expires_at < Date.now()) return { valid: false };
+    return { valid: true, rec: rowToRec(row) };
+  }
+
+  listKeys() {
+    return this.sql
+      .exec("SELECT key, name, created_at, expires_at, disabled FROM api_keys ORDER BY created_at DESC")
+      .toArray()
+      .map((r) => ({ key: r.key, name: r.name || "", createdAt: r.created_at, expiresAt: r.expires_at, disabled: !!r.disabled }));
+  }
+
+  createKey(b) {
+    const name = (typeof b.name === "string" ? b.name : "").slice(0, 64);
+    const ttlDays = Number(b.ttlDays);
+    const now = Date.now();
+    const expiresAt = ttlDays && ttlDays > 0 ? now + ttlDays * 86400 * 1000 : null;
+    const key = typeof b.key === "string" && b.key.trim() ? b.key.trim() : genKey();
+    if (this.sql.exec("SELECT 1 FROM api_keys WHERE key=?", key).toArray()[0]) return { error: "key 已存在" };
+    this.sql.exec(
+      "INSERT INTO api_keys(key, name, created_at, expires_at, disabled, allowed_models, limits) VALUES(?,?,?,?,0,NULL,NULL)",
+      key, name, now, expiresAt
+    );
+    return { ok: true, key, name, createdAt: now, expiresAt, disabled: false };
+  }
+
+  updateKey(b) {
+    const key = typeof b.key === "string" ? b.key : "";
+    if (!key) return { error: "missing key" };
+    const row = this.sql.exec("SELECT name, expires_at, disabled FROM api_keys WHERE key=?", key).toArray()[0];
+    if (!row) return { error: "not found" };
+    let name = row.name, disabled = row.disabled, expiresAt = row.expires_at;
+    if (typeof b.name === "string") name = b.name.slice(0, 64);
+    if (typeof b.disabled === "boolean") disabled = b.disabled ? 1 : 0;
+    if ("ttlDays" in b) {
+      const t = Number(b.ttlDays);
+      expiresAt = t && t > 0 ? Date.now() + t * 86400 * 1000 : null;
+    }
+    this.sql.exec("UPDATE api_keys SET name=?, disabled=?, expires_at=? WHERE key=?", name, disabled, expiresAt, key);
+    return { ok: true };
+  }
+
+  deleteKey(b) {
+    const key = typeof b.key === "string" ? b.key : "";
+    if (!key) return { error: "missing key" };
+    this.sql.exec("DELETE FROM api_keys WHERE key=?", key);
+    return { ok: true };
+  }
+
+  // 登录爆破防护:成功清零;失败窗口内累加,达阈值锁定;锁定期内一律 locked。
+  loginRecord(b) {
+    const ip = typeof b.ip === "string" ? b.ip : "unknown";
+    const ok = !!b.ok;
+    const now = Date.now();
+    const cur = this.sql.exec("SELECT fails, window_start, lock_until FROM login_guard WHERE ip=?", ip).toArray()[0] || {
+      fails: 0, window_start: now, lock_until: 0,
+    };
+
+    if (cur.lock_until > now) return { locked: true, retryAfter: Math.ceil((cur.lock_until - now) / 1000) };
     if (ok) {
-      await this.state.storage.delete("s");
-      return Response.json({ locked: false });
+      this.sql.exec("DELETE FROM login_guard WHERE ip=?", ip);
+      return { locked: false };
     }
-    if (now - s.windowStart > ADMIN_WINDOW_MS) {
-      s.windowStart = now;
-      s.fails = 0;
+    let fails = cur.fails, ws = cur.window_start;
+    if (now - ws > ADMIN_WINDOW_MS) { ws = now; fails = 0; }
+    fails += 1;
+    if (fails >= ADMIN_MAX_FAILS) {
+      const lock = now + ADMIN_LOCK_MS;
+      this.sql.exec("INSERT OR REPLACE INTO login_guard(ip, fails, window_start, lock_until) VALUES(?,?,?,?)", ip, 0, now, lock);
+      return { locked: true, retryAfter: Math.ceil(ADMIN_LOCK_MS / 1000) };
     }
-    s.fails += 1;
-    if (s.fails >= ADMIN_MAX_FAILS) {
-      s.lockUntil = now + ADMIN_LOCK_MS;
-      s.fails = 0;
-      s.windowStart = now;
-      await this.state.storage.put("s", s);
-      return Response.json({ locked: true, retryAfter: Math.ceil(ADMIN_LOCK_MS / 1000) });
-    }
-    await this.state.storage.put("s", s);
-    return Response.json({ locked: false });
+    this.sql.exec("INSERT OR REPLACE INTO login_guard(ip, fails, window_start, lock_until) VALUES(?,?,?,?)", ip, fails, ws, 0);
+    return { locked: false };
   }
 }
