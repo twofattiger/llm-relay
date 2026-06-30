@@ -18,8 +18,11 @@ name = "RELAY_DO"
 class_name = "RelayStore"
 
 [[migrations]]
-tag = "v1"
-new_sqlite_classes = ["RelayStore"]   # SQLite 版 DO,免费档可用
+tag = "v2"
+# 因为旧版本有LoginGuard，需要移除掉
+deleted_classes = ["LoginGuard"]
+new_sqlite_classes = ["RelayStore"]
+
 
 # 敏感变量(secret),用 npx wrangler secret put 注入,勿明文写在此文件
 # -------------------------------------------------------------------------
