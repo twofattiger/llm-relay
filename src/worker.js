@@ -86,6 +86,11 @@ export default {
       if (req.method === "GET" && up.startsWith("/user/key/")) return handleUserKeyPage(req, env);
     }
 
+    // GET /v1/models 获取模型列表
+    if (req.method === "GET" && new URL(req.url).pathname === "/v1/models") {
+      return handleModelsList(req, env);
+    }
+
     if (req.method !== "POST") {
       return json({ error: { message: "Method not allowed", type: "invalid_request_error" } }, 405);
     }
@@ -117,6 +122,18 @@ export default {
     const model = body.model;
     if (!model || typeof model !== "string") {
       return json({ error: { message: "Missing 'model'", type: "invalid_request_error" } }, 400);
+    }
+
+    // 模型白名单校验
+    if (env.SUPPORT_LLMS) {
+      try {
+        const supported = JSON.parse(env.SUPPORT_LLMS);
+        if (Array.isArray(supported) && supported.length > 0 && !supported.includes(model)) {
+          return json({ error: { message: `Model '${model}' is not supported. Supported models are: ${supported.join(", ")}`, type: "invalid_request_error" } }, 400);
+        }
+      } catch (e) {
+        // 解析失败忽略
+      }
     }
 
     // Anthropic 入口收到非 Claude 模型 → 翻译成 OpenAI 调上游再转回(类 OpenRouter)
@@ -314,6 +331,36 @@ function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
     headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+  });
+}
+
+// GET /v1/models 获取模型列表
+async function handleModelsList(req, env) {
+  const token =
+    (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") ||
+    req.headers.get("x-api-key") ||
+    "";
+  if (!(await authClient(token, env))) {
+    return json({ error: { message: "Unauthorized", type: "authentication_error" } }, 401);
+  }
+
+  let supportedModels = [];
+  if (env.SUPPORT_LLMS) {
+    try {
+      supportedModels = JSON.parse(env.SUPPORT_LLMS);
+    } catch (e) {}
+  }
+  if (!Array.isArray(supportedModels)) supportedModels = [];
+
+  const now = Math.floor(Date.now() / 1000);
+  return json({
+    object: "list",
+    data: supportedModels.map(m => ({
+      id: m,
+      object: "model",
+      created: now,
+      owned_by: "system"
+    }))
   });
 }
 
@@ -538,56 +585,69 @@ async function handleAdminKeyDelete(req, env) {
 
 // ============================================================
 // 公用「示例」:管理面板(master key 填充)与 /user/key/<key> 页(该 key 填充)共用。
-// 返回纯文本(可整段复制),已把 key 直接填进各示例。
 // ============================================================
-function buildExamples(origin, key) {
-  const b = origin;
-  return [
-    `# ① Workers AI(@cf/,免费额度)`,
-    `curl ${b}/v1/chat/completions -H 'Authorization: Bearer ${key}' \\`,
-    `  -d '{"model":"@cf/meta/llama-3.2-3b-instruct","messages":[{"role":"user","content":"你好"}]}'`,
-    ``,
-    `# ② BYOK(无前缀,用你自己的 provider key)`,
-    `curl ${b}/v1/chat/completions -H 'Authorization: Bearer ${key}' \\`,
-    `  -d '{"model":"deepseek/deepseek-chat","messages":[{"role":"user","content":"你好"}]}'`,
-    ``,
-    `# ③ Anthropic BYOK(/v1/messages,用 x-api-key)`,
-    `curl ${b}/v1/messages -H 'x-api-key: ${key}' -H 'anthropic-version: 2023-06-01' \\`,
-    `  -d '{"model":"claude-haiku-4-5","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'`,
-    ``,
-    `# ④ 统一计费(@/,扣 credits)`,
-    `curl ${b}/v1/chat/completions -H 'Authorization: Bearer ${key}' \\`,
-    `  -d '{"model":"@/deepseek/deepseek-chat","messages":[{"role":"user","content":"你好"}]}'`,
-    ``,
-    `# ===== Cursor(Settings → Models → OpenAI API Key)=====`,
-    `#   API Key:           ${key}`,
-    `#   Override Base URL: ${b}/v1`,
-    `#   Add model:         deepseek/deepseek-chat  /  @/openai/gpt-4o  /  @cf/meta/llama-3.3-70b-instruct`,
-    `#   只支持 OpenAI 格式;开启 Override 后与内置 Pro 模型二选一。`,
-    ``,
-    `# ===== Claude Code(环境变量)=====`,
-    `export ANTHROPIC_BASE_URL="${b}"            # 不带 /v1`,
-    `export ANTHROPIC_API_KEY="${key}"`,
-    `export ANTHROPIC_MODEL="claude-sonnet-4-5"            # 主模型(非 Claude 也行,如 deepseek/deepseek-chat)`,
-    `export ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-4-5"  # 后台小任务模型,必须也可调通`,
-    ``,
-    `# ===== OpenCode(opencode.json)=====`,
-    `{`,
-    `  "provider": {`,
-    `    "llmrelay": {`,
-    `      "npm": "@ai-sdk/openai-compatible",`,
-    `      "name": "LLM Relay",`,
-    `      "options": { "baseURL": "${b}/v1", "apiKey": "${key}" },`,
-    `      "models": {`,
-    `        "deepseek/deepseek-chat": {},`,
-    `        "@/openai/gpt-4o": {},`,
-    `        "@cf/meta/llama-3.3-70b-instruct": {}`,
-    `      }`,
-    `    }`,
-    `  }`,
-    `}`,
-  ].join("\n");
-}
+const BUILD_EXAMPLES_JS = `function buildExamples(origin, key, m) {
+  var b = origin;
+  var selM = m || "@cf/meta/llama-3.2-3b-instruct";
+  var curlParts = [];
+
+  if (selM.indexOf("@cf/") === 0) {
+    curlParts = [
+      "# Workers AI(@cf/,免费额度)",
+      "curl " + b + "/v1/chat/completions -H 'Authorization: Bearer " + key + "' \\\\",
+      "  -d '{\\"model\\":\\"" + selM + "\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'"
+    ];
+  } else if (selM.indexOf("@/") === 0) {
+    curlParts = [
+      "# 统一计费(@/,扣 credits)",
+      "curl " + b + "/v1/chat/completions -H 'Authorization: Bearer " + key + "' \\\\",
+      "  -d '{\\"model\\":\\"" + selM + "\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'"
+    ];
+  } else if (selM.indexOf("claude-") === 0) {
+    curlParts = [
+      "# Anthropic BYOK(/v1/messages,用 x-api-key)",
+      "curl " + b + "/v1/messages -H 'x-api-key: " + key + "' -H 'anthropic-version: 2023-06-01' \\\\",
+      "  -d '{\\"model\\":\\"" + selM + "\\",\\"max_tokens\\":64,\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'"
+    ];
+  } else {
+    curlParts = [
+      "# BYOK(无前缀,用你自己的 provider key)",
+      "curl " + b + "/v1/chat/completions -H 'Authorization: Bearer " + key + "' \\\\",
+      "  -d '{\\"model\\":\\"" + selM + "\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'"
+    ];
+  }
+
+  return curlParts.concat([
+    "",
+    "# ===== Cursor(Settings → Models → OpenAI API Key)=====",
+    "#   API Key:           " + key,
+    "#   Override Base URL: " + b + "/v1",
+    "#   Add model:         " + selM + "  /  @/openai/gpt-4o  /  @cf/meta/llama-3.3-70b-instruct",
+    "#   只支持 OpenAI 格式;开启 Override 后与内置 Pro 模型二选一。",
+    "",
+    "# ===== Claude Code(环境变量)=====",
+    "export ANTHROPIC_BASE_URL=\\"" + b + "\\"            # 不带 /v1",
+    "export ANTHROPIC_API_KEY=\\"" + key + "\\"",
+    "export ANTHROPIC_MODEL=\\"" + selM + "\\"            # 主模型(非 Claude 也行,如 deepseek/deepseek-chat)",
+    "export ANTHROPIC_SMALL_FAST_MODEL=\\"claude-haiku-4-5\\"  # 后台小任务模型,必须也可调通",
+    "",
+    "# ===== OpenCode(opencode.json)=====",
+    "{",
+    "  \\"provider\\": {",
+    "    \\"llmrelay\\": {",
+    "      \\"npm\\": \\"@ai-sdk/openai-compatible\\",",
+    "      \\"name\\": \\"LLM Relay\\",",
+    "      \\"options\\": { \\"baseURL\\": \\"" + b + "/v1\\", \\"apiKey\\": \\"" + key + "\\" },",
+    "      \\"models\\": {",
+    "        \\"" + selM + "\\": {},",
+    "        \\"@/openai/gpt-4o\\": {},",
+    "        \\"@cf/meta/llama-3.3-70b-instruct\\": {}",
+    "      }",
+    "    }",
+    "  }",
+    "}"
+  ]).join("\\n");
+}`;
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -597,7 +657,11 @@ function escapeHtml(s) {
 async function handleAdminExamples(req, env) {
   if (!(await verifySession(req, env))) return json({ error: "Unauthorized" }, 401);
   const origin = new URL(req.url).origin;
-  return json({ text: buildExamples(origin, "<MY_API_KEY>") });
+  let supportedModels = [];
+  if (env.SUPPORT_LLMS) {
+    try { supportedModels = JSON.parse(env.SUPPORT_LLMS); } catch(e) {}
+  }
+  return json({ origin, key: "<MY_API_KEY>", models: supportedModels });
 }
 
 // GET /user/key/<key> → 校验 key(存在/未禁用/未过期)后,展示用该 key 填充的示例;无效则报错。
@@ -608,7 +672,7 @@ async function handleUserKeyPage(req, env) {
   if (!key || !(await authClient(key, env))) {
     return new Response(USER_ERROR_HTML, { status: 403, headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
-  const html = userKeyPageHtml(url.origin, key);
+  const html = userKeyPageHtml(url.origin, key, env);
   return new Response(html, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
@@ -620,14 +684,18 @@ h1{font-size:18px} .m{color:#666}</style></head><body>
 <p class="m">该 API Key 不存在、已被禁用或已过期。请联系管理员重新获取。</p>
 </body></html>`;
 
-function userKeyPageHtml(origin, key) {
-  const examples = buildExamples(origin, key);
+function userKeyPageHtml(origin, key, env) {
+  let supportedModels = [];
+  if (env.SUPPORT_LLMS) {
+    try { supportedModels = JSON.parse(env.SUPPORT_LLMS); } catch(e) {}
+  }
   return `<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>llm-relay 接入示例</title>
 <style>
   body{font:14px/1.5 -apple-system,system-ui,sans-serif;max-width:820px;margin:0 auto;padding:24px 16px;color:#1a1a1a}
   h1{font-size:18px;margin:0 0 16px} h2{font-size:14px;margin:20px 0 8px;color:#666}
   button{cursor:pointer;font:inherit;padding:6px 12px;border:none;border-radius:8px;background:#f4511e;color:#fff}
+  select{font:inherit;padding:6px 12px;border:1px solid #ccc;border-radius:8px;}
   .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   code.kk{font-size:13px;background:#f3f3f3;padding:4px 8px;border-radius:6px;word-break:break-all}
   pre{background:#f7f7f7;border:1px solid #e8e8e8;border-radius:8px;padding:12px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
@@ -636,12 +704,37 @@ function userKeyPageHtml(origin, key) {
 <h1>llm-relay 接入示例</h1>
 <div class="meta">你的 API Key</div>
 <div class="row"><code class="kk" id="k">${escapeHtml(key)}</code><button onclick="cp(K)">复制 Key</button></div>
-<h2>示例</h2>
-<pre id="ex">${escapeHtml(examples)}</pre>
+<div class="row" style="margin-top:20px;">
+  <h2>示例</h2>
+  <div style="flex:1"></div>
+  <select id="modelSel">
+  </select>
+</div>
+<pre id="ex"></pre>
 <div class="row"><button onclick="cp(document.getElementById('ex').textContent)">复制全部示例</button></div>
 <script>
+  ${BUILD_EXAMPLES_JS}
   var K=${JSON.stringify(key)};
+  var O=${JSON.stringify(origin)};
+  var M=${JSON.stringify(supportedModels)};
   function cp(s){if(navigator.clipboard)navigator.clipboard.writeText(s);}
+  
+  var sel=document.getElementById('modelSel');
+  if(M && M.length>0){
+    for(var i=0;i<M.length;i++){
+      var opt=document.createElement('option');
+      opt.value=M[i]; opt.textContent=M[i];
+      sel.appendChild(opt);
+    }
+  } else {
+    sel.style.display='none';
+  }
+  
+  function render(){
+    document.getElementById('ex').textContent=buildExamples(O, K, sel.value);
+  }
+  sel.onchange=render;
+  render();
 </script>
 </body></html>`;
 }
@@ -717,21 +810,48 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   <div class="meta">动态 key 存在公用 DO(SQLite),另有一个 <code class="kk">MY_API_KEY</code>(master)始终有效、不在此列。吊销/改有效期最多约 1 分钟后全网生效(isolate 缓存)。配额/次数限制待后续。</div>
 
   <h2>示例</h2>
+  <div class="row" style="margin-bottom:8px;">
+    <div style="flex:1"></div>
+    <select id="adminModelSel" class="hide">
+    </select>
+  </div>
   <pre id="examples"></pre>
   <div class="meta">以上示例用 master key(<code class="kk">MY_API_KEY</code>)填充;每把动态 key 的专属示例页可在上方「复制示例」拿到链接。统计有几分钟延迟,非实时。</div>
 </div>
 
 <script>
+  ${BUILD_EXAMPLES_JS}
   var $=function(id){return document.getElementById(id);};
   function esc(s){return String(s).replace(/[&<>]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c];});}
   function show(el,on){el.classList[on?"remove":"add"]("hide");}
+
+  var adminExamplesData = null;
+  function renderAdminExamples(){
+    if(!adminExamplesData) return;
+    $("examples").textContent=buildExamples(adminExamplesData.origin, adminExamplesData.key, $("adminModelSel").value);
+  }
+  $("adminModelSel").onchange=renderAdminExamples;
 
   async function loadExamples(){
     try{
       var r=await fetch("/admin/api/examples",{credentials:"same-origin"});
       if(r.status===401){enterLogin();return;}
       var d=await r.json();
-      $("examples").textContent=r.ok?d.text:("加载示例失败:"+(d.error||r.status));
+      if(!r.ok){ $("examples").textContent="加载示例失败:"+(d.error||r.status); return; }
+      adminExamplesData = d;
+      var sel=$("adminModelSel");
+      if(d.models && d.models.length>0){
+        sel.innerHTML='';
+        for(var i=0;i<d.models.length;i++){
+          var opt=document.createElement('option');
+          opt.value=d.models[i]; opt.textContent=d.models[i];
+          sel.appendChild(opt);
+        }
+        show(sel, true);
+      } else {
+        show(sel, false);
+      }
+      renderAdminExamples();
     }catch(e){$("examples").textContent="加载示例失败:"+e.message;}
   }
 
