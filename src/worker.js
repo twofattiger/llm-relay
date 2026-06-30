@@ -589,7 +589,9 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
       <option value="30">30 天</option>
       <option value="90">90 天</option>
       <option value="365">365 天</option>
+      <option value="custom">自定义…</option>
     </select>
+    <input id="kdate" type="datetime-local" class="hide">
     <button id="kcreate">新建 Key</button>
   </div>
   <div class="err" id="kerr"></div>
@@ -675,12 +677,30 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   async function createKey(){
     $("kerr").textContent=""; $("kcreate").disabled=true;
     try{
-      var r=await fetch("/admin/api/keys",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:$("kname").value,ttlDays:Number($("kttl").value)})});
+      var payload={name:$("kname").value};
+      if($("kttl").value==="custom"){
+        var v=$("kdate").value;
+        if(!v)throw new Error("请选择自定义到期时间");
+        payload.expiresAt=new Date(v).getTime(); // datetime-local 为本地时间,getTime 得 UTC 毫秒
+      }else{
+        payload.ttlDays=Number($("kttl").value);
+      }
+      var r=await fetch("/admin/api/keys",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
       var d=await r.json();
       if(!r.ok)throw new Error(d.error||("HTTP "+r.status));
       $("kname").value=""; loadKeys();
     }catch(e){$("kerr").textContent="创建失败:"+e.message;}
     finally{$("kcreate").disabled=false;}
+  }
+  function toggleCustomDate(){
+    var on=$("kttl").value==="custom";
+    show($("kdate"),on);
+    if(on){
+      // 默认填「明天此刻」,并把可选下限设为当前(本地时区)
+      var local=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
+      $("kdate").min=local;
+      if(!$("kdate").value)$("kdate").value=new Date(Date.now()+86400000-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
+    }
   }
   async function keyAction(url,payload){
     var r=await fetch(url,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
@@ -711,6 +731,7 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   $("logout").onclick=async function(){await fetch("/admin/logout",{method:"POST",credentials:"same-origin"});enterLogin();};
 
   $("kcreate").onclick=createKey;
+  $("kttl").onchange=toggleCustomDate;
   $("ktbl").addEventListener("click",function(e){
     var t=e.target; if(t.tagName!=="BUTTON")return;
     if(t.dataset.copy!=null){
@@ -739,6 +760,18 @@ function genKey() {
   let hex = "";
   for (const x of b) hex += x.toString(16).padStart(2, "0");
   return "sk-relay-" + hex;
+}
+
+// 解析到期时间戳(ms):优先用绝对 expiresAt(面板"自定义"日期控件传来),否则用 ttlDays 天数。
+// 返回:number=具体到期 / null=永不过期 / undefined=非法(过去或无效)→ 调用方应报错。
+function resolveExpiry(b, now) {
+  if (b.expiresAt != null && b.expiresAt !== "") {
+    const t = Number(b.expiresAt);
+    if (!Number.isFinite(t) || t <= now) return undefined;
+    return t;
+  }
+  const ttlDays = Number(b.ttlDays);
+  return ttlDays && ttlDays > 0 ? now + ttlDays * 86400 * 1000 : null;
 }
 
 // api_keys 行 → 对外结构(给缓存判过期 / 面板展示)
@@ -807,9 +840,9 @@ export class RelayStore {
 
   createKey(b) {
     const name = (typeof b.name === "string" ? b.name : "").slice(0, 64);
-    const ttlDays = Number(b.ttlDays);
     const now = Date.now();
-    const expiresAt = ttlDays && ttlDays > 0 ? now + ttlDays * 86400 * 1000 : null;
+    const expiresAt = resolveExpiry(b, now);
+    if (expiresAt === undefined) return { error: "到期时间需晚于当前时间" };
     const key = typeof b.key === "string" && b.key.trim() ? b.key.trim() : genKey();
     if (this.sql.exec("SELECT 1 FROM api_keys WHERE key=?", key).toArray()[0]) return { error: "key 已存在" };
     this.sql.exec(
@@ -827,9 +860,10 @@ export class RelayStore {
     let name = row.name, disabled = row.disabled, expiresAt = row.expires_at;
     if (typeof b.name === "string") name = b.name.slice(0, 64);
     if (typeof b.disabled === "boolean") disabled = b.disabled ? 1 : 0;
-    if ("ttlDays" in b) {
-      const t = Number(b.ttlDays);
-      expiresAt = t && t > 0 ? Date.now() + t * 86400 * 1000 : null;
+    if ("ttlDays" in b || "expiresAt" in b) {
+      const e = resolveExpiry(b, Date.now());
+      if (e === undefined) return { error: "到期时间需晚于当前时间" };
+      expiresAt = e;
     }
     this.sql.exec("UPDATE api_keys SET name=?, disabled=?, expires_at=? WHERE key=?", name, disabled, expiresAt, key);
     return { ok: true };
