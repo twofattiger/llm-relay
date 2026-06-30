@@ -101,7 +101,8 @@ export default {
       (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") ||
       req.headers.get("x-api-key") ||
       "";
-    if (!(await authClient(token, env))) {
+    const auth = await authClient(token, env);
+    if (!auth) {
       return json({ error: { message: "Unauthorized", type: "authentication_error" } }, 401);
     }
 
@@ -124,16 +125,9 @@ export default {
       return json({ error: { message: "Missing 'model'", type: "invalid_request_error" } }, 400);
     }
 
-    // 模型白名单校验
-    if (env.SUPPORT_LLMS) {
-      try {
-        const supported = JSON.parse(env.SUPPORT_LLMS);
-        if (Array.isArray(supported) && supported.length > 0 && !supported.includes(model)) {
-          return json({ error: { message: `Model '${model}' is not supported. Supported models are: ${supported.join(", ")}`, type: "invalid_request_error" } }, 400);
-        }
-      } catch (e) {
-        // 解析失败忽略
-      }
+    // 模型校验:按当前 key 的 allowed_models 判定(-1 不限 / 0 = SUPPORT_LLMS 全部 / 列表)
+    if (!isModelAllowed(model, auth.allowedModels, env)) {
+      return json({ error: { message: `Model '${model}' is not allowed for this key`, type: "invalid_request_error" } }, 403);
     }
 
     // Anthropic 入口收到非 Claude 模型 → 翻译成 OpenAI 调上游再转回(类 OpenRouter)
@@ -283,20 +277,21 @@ function relayStub(env) {
   return env.RELAY_DO.get(env.RELAY_DO.idFromName("relay"));
 }
 
-// isolate 级缓存:已校验通过的 token → 该缓存项的过期时间戳(ms)。
+// isolate 级缓存:已校验通过的 token → { exp:缓存到期(ms), rec:{ allowedModels } }。
 // 只缓存"通过"的结果(新建 key 即时可用);吊销/过期最多滞后 KEY_CACHE_TTL_MS 生效。
 const keyCache = new Map();
 const KEY_CACHE_TTL_MS = 60 * 1000;
 
-// 对外 key 校验:master 恒定时间比对 → isolate 缓存 → 问 DO
+// 对外 key 校验:master 恒定时间比对 → isolate 缓存 → 问 DO。
+// 返回:通过 → { allowedModels }(master 与历史无值的 key 默认 "-1" 不限);不通过 → null。
 async function authClient(token, env) {
-  if (!token) return false;
-  if (env.MY_API_KEY && safeEqual(token, env.MY_API_KEY)) return true;
-  if (!env.RELAY_DO) return false;
+  if (!token) return null;
+  if (env.MY_API_KEY && safeEqual(token, env.MY_API_KEY)) return { allowedModels: "-1" };
+  if (!env.RELAY_DO) return null;
 
   const now = Date.now();
   const hit = keyCache.get(token);
-  if (hit && hit > now) return true;
+  if (hit && hit.exp > now) return hit.rec;
 
   try {
     const r = await relayStub(env).fetch("https://do/keys/validate", {
@@ -305,17 +300,40 @@ async function authClient(token, env) {
     });
     const d = await r.json();
     if (d.valid) {
+      const rec = { allowedModels: d.rec && d.rec.allowedModels != null ? d.rec.allowedModels : "-1" };
       // 缓存到 min(TTL, key 自身到期),避免缓存把已过期的 key 续命
       let exp = now + KEY_CACHE_TTL_MS;
       if (d.rec && d.rec.expiresAt) exp = Math.min(exp, d.rec.expiresAt);
-      keyCache.set(token, exp);
-      return true;
+      keyCache.set(token, { exp, rec });
+      return rec;
     }
   } catch {
     // DO 故障:master 仍可用,动态 key 此刻不放行(fail-closed)
   }
   keyCache.delete(token);
-  return false;
+  return null;
+}
+
+// 解析 SUPPORT_LLMS(env 里的 JSON 字符串数组),失败/未配置返回 []
+function parseSupportLlms(env) {
+  if (!env.SUPPORT_LLMS) return [];
+  try {
+    const a = JSON.parse(env.SUPPORT_LLMS);
+    return Array.isArray(a) ? a : [];
+  } catch {
+    return [];
+  }
+}
+
+// 按 key 的 allowed_models 判定模型是否放行:
+//   "-1"/空/未设 → 不限(任意模型,含不在 SUPPORT_LLMS 的)
+//   "0"          → 必须在 SUPPORT_LLMS 中(列表后期扩充自动生效)
+//   其它          → 用 ; 或 , 分隔为允许列表,模型须在其中
+function isModelAllowed(model, allowedModels, env) {
+  if (allowedModels == null || allowedModels === "" || allowedModels === "-1") return true;
+  if (allowedModels === "0") return parseSupportLlms(env).includes(model);
+  const list = String(allowedModels).split(/[;,]/).map((s) => s.trim()).filter(Boolean);
+  return list.includes(model);
 }
 
 // 恒定时间字符串比较,降低 API key 定时攻击风险
@@ -669,11 +687,22 @@ async function handleUserKeyPage(req, env) {
   const url = new URL(req.url);
   let key = url.pathname.slice("/user/key/".length);
   try { key = decodeURIComponent(key); } catch {}
-  if (!key || !(await authClient(key, env))) {
+  const auth = key ? await authClient(key, env) : null;
+  if (!auth) {
     return new Response(USER_ERROR_HTML, { status: 403, headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
-  const html = userKeyPageHtml(url.origin, key, env);
+  // 模型下拉:-1/0 显示 SUPPORT_LLMS 全部;指定列表则显示该 key 的允许模型
+  const models = modelsForKey(auth.allowedModels, env);
+  const html = userKeyPageHtml(url.origin, key, models);
   return new Response(html, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+// 该 key 在示例页可选的模型列表
+function modelsForKey(allowedModels, env) {
+  if (allowedModels == null || allowedModels === "" || allowedModels === "-1" || allowedModels === "0") {
+    return parseSupportLlms(env);
+  }
+  return String(allowedModels).split(/[;,]/).map((s) => s.trim()).filter(Boolean);
 }
 
 const USER_ERROR_HTML = `<!doctype html><html lang="zh"><head><meta charset="utf-8">
@@ -684,11 +713,8 @@ h1{font-size:18px} .m{color:#666}</style></head><body>
 <p class="m">该 API Key 不存在、已被禁用或已过期。请联系管理员重新获取。</p>
 </body></html>`;
 
-function userKeyPageHtml(origin, key, env) {
-  let supportedModels = [];
-  if (env.SUPPORT_LLMS) {
-    try { supportedModels = JSON.parse(env.SUPPORT_LLMS); } catch(e) {}
-  }
+function userKeyPageHtml(origin, key, models) {
+  const supportedModels = Array.isArray(models) ? models : [];
   return `<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>llm-relay 接入示例</title>
 <style>
@@ -761,6 +787,10 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   code.kk{font-size:12px;background:#f3f3f3;padding:2px 5px;border-radius:5px;word-break:break-all}
   .pill{font-size:12px;padding:1px 7px;border-radius:999px}
   .pill.on{background:#e6f4ea;color:#137333} .pill.off{background:#fce8e6;color:#c5221f}
+  #mdlg{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:10}
+  #mdlg.hide{display:none}
+  .mbox{background:#fff;border-radius:12px;padding:16px 20px;width:90%;max-width:460px;max-height:70vh;overflow:auto}
+  .mbox ul{margin:8px 0 0;padding-left:18px} .mbox li{word-break:break-all}
 </style></head><body>
 
 <div id="login" class="hide">
@@ -802,10 +832,16 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
       <option value="custom">自定义…</option>
     </select>
     <input id="kdate" type="datetime-local" class="hide">
+    <select id="kmode">
+      <option value="-1">模型:不限</option>
+      <option value="0">模型:全部(列表内)</option>
+      <option value="list">模型:指定…</option>
+    </select>
     <button id="kcreate">新建 Key</button>
   </div>
+  <div id="kmodels" class="hide" style="margin:4px 0 8px;padding:8px;border:1px solid var(--line);border-radius:8px"></div>
   <div class="err" id="kerr"></div>
-  <table id="ktbl"><thead><tr><th>名称</th><th>Key</th><th>创建</th><th>到期</th><th>状态</th><th>操作</th></tr></thead><tbody></tbody></table>
+  <table id="ktbl"><thead><tr><th>名称</th><th>Key</th><th>创建</th><th>到期</th><th>支持模型</th><th>状态</th><th>操作</th></tr></thead><tbody></tbody></table>
   <div class="meta" id="kmeta"></div>
   <div class="meta">动态 key 存在公用 DO(SQLite),另有一个 <code class="kk">MY_API_KEY</code>(master)始终有效、不在此列。吊销/改有效期最多约 1 分钟后全网生效(isolate 缓存)。配额/次数限制待后续。</div>
 
@@ -817,6 +853,13 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
   </div>
   <pre id="examples"></pre>
   <div class="meta">以上示例用 master key(<code class="kk">MY_API_KEY</code>)填充;每把动态 key 的专属示例页可在上方「复制示例」拿到链接。统计有几分钟延迟,非实时。</div>
+</div>
+
+<div id="mdlg" class="hide">
+  <div class="mbox">
+    <div class="row" style="justify-content:space-between"><h2 style="margin:0">支持的模型</h2><button class="ghost mini" id="mdlgClose">关闭</button></div>
+    <ul id="mdlgList"></ul>
+  </div>
 </div>
 
 <script>
@@ -888,6 +931,10 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
       (d.keys||[]).forEach(function(k){
         var expired=k.expiresAt&&k.expiresAt<now;
         var stat=k.disabled?"<span class='pill off'>已禁用</span>":(expired?"<span class='pill off'>已过期</span>":"<span class='pill on'>启用</span>");
+        var am=k.allowedModels, amCell;
+        if(am==null||am==="-1")amCell="不限";
+        else if(am==="0")amCell="全部";
+        else amCell="<button class='ghost mini' data-models='"+esc(am)+"'>部分</button>";
         var tr=document.createElement("tr");
         tr.innerHTML=
           "<td>"+esc(k.name||"-")+"</td>"+
@@ -895,6 +942,7 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
           "<button class='ghost mini' data-copyex='"+esc(k.key)+"'>复制示例</button></td>"+
           "<td>"+(k.createdAt?fmtTs(k.createdAt):"-")+"</td>"+
           "<td>"+(k.expiresAt?fmtTs(k.expiresAt):"永不")+"</td>"+
+          "<td>"+amCell+"</td>"+
           "<td>"+stat+"</td>"+
           "<td><button class='ghost mini' data-toggle='"+esc(k.key)+"' data-dis='"+(k.disabled?"0":"1")+"'>"+(k.disabled?"启用":"禁用")+"</button> "+
           "<button class='ghost mini' data-del='"+esc(k.key)+"'>删除</button></td>";
@@ -916,7 +964,15 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
       payload.ttlDays=Number($("kttl").value);
       expDesc=payload.ttlDays>0?(payload.ttlDays+" 天后"):"永不过期";
     }
-    if(!confirm("确认新建 Key？\\n名称:"+(payload.name||"(无)")+"\\n有效期:"+expDesc))return;
+    var mode=$("kmode").value, modelDesc;
+    if(mode==="-1"){payload.allowedModels="-1";modelDesc="不限";}
+    else if(mode==="0"){payload.allowedModels="0";modelDesc="列表内全部";}
+    else{
+      var checked=[].slice.call($("kmodels").querySelectorAll("input:checked")).map(function(c){return c.value;});
+      if(!checked.length){$("kerr").textContent="请勾选至少一个模型,或改为不限/全部";return;}
+      payload.allowedModels=checked.join(",");modelDesc=checked.join("、");
+    }
+    if(!confirm("确认新建 Key？\\n名称:"+(payload.name||"(无)")+"\\n有效期:"+expDesc+"\\n可用模型:"+modelDesc))return;
     $("kcreate").disabled=true;
     try{
       var r=await fetch("/admin/api/keys",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
@@ -934,6 +990,23 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
       var local=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
       $("kdate").min=local;
       if(!$("kdate").value)$("kdate").value=new Date(Date.now()+86400000-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
+    }
+  }
+  function toggleModelMode(){
+    var on=$("kmode").value==="list";
+    show($("kmodels"),on);
+    if(on && !$("kmodels").dataset.filled){
+      var models=(adminExamplesData&&adminExamplesData.models)||[];
+      var km=$("kmodels"); km.innerHTML="";
+      if(!models.length){km.textContent="(未配置 SUPPORT_LLMS,无法指定;请改为不限/全部)";}
+      models.forEach(function(m){
+        var lab=document.createElement("label");
+        lab.style.cssText="display:inline-flex;align-items:center;gap:4px;margin:2px 10px 2px 0;font-size:13px";
+        var cb=document.createElement("input"); cb.type="checkbox"; cb.value=m;
+        lab.appendChild(cb); lab.appendChild(document.createTextNode(m));
+        km.appendChild(lab);
+      });
+      km.dataset.filled="1";
     }
   }
   async function keyAction(url,payload){
@@ -966,6 +1039,7 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
 
   $("kcreate").onclick=createKey;
   $("kttl").onchange=toggleCustomDate;
+  $("kmode").onchange=toggleModelMode;
   $("ktbl").addEventListener("click",function(e){
     var t=e.target; if(t.tagName!=="BUTTON")return;
     function flash(){var old=t.textContent;t.textContent="已复制";setTimeout(function(){t.textContent=old;},1000);}
@@ -979,8 +1053,19 @@ const ADMIN_HTML = `<!doctype html><html lang="zh"><head>
       if(confirm((willDisable?"确认禁用":"确认启用")+"该 key？"))keyAction("/admin/api/keys/update",{key:t.dataset.toggle,disabled:willDisable});
     }else if(t.dataset.del!=null){
       if(confirm("删除该 key？此操作不可恢复。"))keyAction("/admin/api/keys/delete",{key:t.dataset.del});
+    }else if(t.dataset.models!=null){
+      showModels(t.dataset.models);
     }
   });
+
+  function showModels(am){
+    var list=String(am).split(/[;,]/).map(function(s){return s.trim();}).filter(Boolean);
+    var ul=$("mdlgList"); ul.innerHTML="";
+    list.forEach(function(m){var li=document.createElement("li");li.textContent=m;ul.appendChild(li);});
+    show($("mdlg"),true);
+  }
+  $("mdlgClose").onclick=function(){show($("mdlg"),false);};
+  $("mdlg").onclick=function(e){if(e.target===this)show($("mdlg"),false);};
 
   // 启动:用 stats 探测是否已有会话
   (async function(){
@@ -1018,7 +1103,7 @@ function rowToRec(r) {
     createdAt: r.created_at,
     expiresAt: r.expires_at,
     disabled: !!r.disabled,
-    allowedModels: r.allowed_models ? JSON.parse(r.allowed_models) : null,
+    allowedModels: r.allowed_models != null ? r.allowed_models : null, // 原样字符串:"-1"/"0"/"a,b"
     limits: r.limits ? JSON.parse(r.limits) : null,
   };
 }
@@ -1070,9 +1155,9 @@ export class RelayStore {
 
   listKeys() {
     return this.sql
-      .exec("SELECT key, name, created_at, expires_at, disabled FROM api_keys ORDER BY created_at DESC")
+      .exec("SELECT key, name, created_at, expires_at, disabled, allowed_models FROM api_keys ORDER BY created_at DESC")
       .toArray()
-      .map((r) => ({ key: r.key, name: r.name || "", createdAt: r.created_at, expiresAt: r.expires_at, disabled: !!r.disabled }));
+      .map((r) => ({ key: r.key, name: r.name || "", createdAt: r.created_at, expiresAt: r.expires_at, disabled: !!r.disabled, allowedModels: r.allowed_models != null ? r.allowed_models : null }));
   }
 
   createKey(b) {
@@ -1080,13 +1165,15 @@ export class RelayStore {
     const now = Date.now();
     const expiresAt = resolveExpiry(b, now);
     if (expiresAt === undefined) return { error: "到期时间需晚于当前时间" };
+    // allowed_models: "-1"=不限(默认) / "0"=SUPPORT_LLMS 全部 / "a,b"=指定列表
+    const allowedModels = typeof b.allowedModels === "string" && b.allowedModels !== "" ? b.allowedModels : "-1";
     const key = typeof b.key === "string" && b.key.trim() ? b.key.trim() : genKey();
     if (this.sql.exec("SELECT 1 FROM api_keys WHERE key=?", key).toArray()[0]) return { error: "key 已存在" };
     this.sql.exec(
-      "INSERT INTO api_keys(key, name, created_at, expires_at, disabled, allowed_models, limits) VALUES(?,?,?,?,0,NULL,NULL)",
-      key, name, now, expiresAt
+      "INSERT INTO api_keys(key, name, created_at, expires_at, disabled, allowed_models, limits) VALUES(?,?,?,?,0,?,NULL)",
+      key, name, now, expiresAt, allowedModels
     );
-    return { ok: true, key, name, createdAt: now, expiresAt, disabled: false };
+    return { ok: true, key, name, createdAt: now, expiresAt, disabled: false, allowedModels };
   }
 
   updateKey(b) {
