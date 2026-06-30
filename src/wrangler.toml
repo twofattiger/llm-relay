@@ -10,15 +10,19 @@ GATEWAY = "cf-ai-gateway"
 # 管理面板查 Worker 用量时用,需与上面的 name 一致
 WORKER_NAME = "llm-relay"
 
-# ---- 管理面板登录防爆破:Durable Object(可选但推荐) ----
-# 不需要面板/防爆破可整段删掉;DO 删掉后 worker.js 会自动跳过防护。
+# ---- 公用存储 RelayStore:Durable Object(SQLite)----
+# 一个 DO 承载:动态对外 API key、登录防爆破、预留用量计数。单实例 idFromName("relay")。
+# 不绑定也能跑:此时只有 MY_API_KEY 有效、面板 Key 管理不可用、登录防爆破跳过。
 [[durable_objects.bindings]]
-name = "LOGIN_GUARD"
-class_name = "LoginGuard"
+name = "RELAY_DO"
+class_name = "RelayStore"
 
 [[migrations]]
-tag = "v1"
-new_sqlite_classes = ["LoginGuard"]   # SQLite 版 DO,免费档可用
+tag = "v2"
+# 因为旧版本有LoginGuard，需要移除掉
+deleted_classes = ["LoginGuard"]
+new_sqlite_classes = ["RelayStore"]
+
 
 # 敏感变量(secret),用 npx wrangler secret put 注入,勿明文写在此文件
 # -------------------------------------------------------------------------
