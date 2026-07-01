@@ -24,7 +24,7 @@ SUPPORT_LLMS = '''[
   "custom-zijie/MiniMax-M3",
   "openrouter/deepseek-v4-flash",
   "custom-agnes/agnes-2.0-flash",
-  "dynamic/deepseek",
+  "dynamic/deepseek"
 ]'''
 
 # ---- 公用存储 RelayStore:Durable Object(SQLite)----
