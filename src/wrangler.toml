@@ -9,7 +9,7 @@ ACCOUNT_ID = "你的_CLOUDFLARE_账号ID"
 GATEWAY = "cf-ai-gateway"
 # 管理面板查 Worker 用量时用,需与上面的 name 一致
 WORKER_NAME = "llm-relay"
-# 允许的模型列表，配置此项后仅允许使用列表中的模型
+# 允许的模型列表，配置此项后仅允许使用列表中的模型，dynamic/xxx 是动态路由模型
 SUPPORT_LLMS = '''[
   "@cf/meta/llama-3.2-3b-instruct",
   "@/deepseek/deepseek-chat",
@@ -23,7 +23,8 @@ SUPPORT_LLMS = '''[
   "custom-zijie/GLM-5.2",
   "custom-zijie/MiniMax-M3",
   "openrouter/deepseek-v4-flash",
-  "custom-agnes/agnes-2.0-flash"
+  "custom-agnes/agnes-2.0-flash",
+  "dynamic/deepseek",
 ]'''
 
 # ---- 公用存储 RelayStore:Durable Object(SQLite)----
