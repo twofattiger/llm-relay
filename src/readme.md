@@ -329,6 +329,12 @@ npx wrangler tail
 
 > 占位说明:下文中 `<...>` 的模型 ID 需替换成真实值。Workers AI 的 `@cf/...` ID 见 Dashboard 的 Workers AI models 页或 `GET /accounts/{id}/ai/models/search`;统一计费的 `provider/model` 见 AI Gateway 的 supported-models / model catalog;BYOK 的 provider slug 以你在 Provider Keys 里配置的为准。
 
+> **不知道能用哪些 model?** 直接查本服务的模型列表接口(OpenAI 兼容 `GET /v1/models`,详见 §6.9):
+> ```bash
+> curl "$BASE/v1/models" -H "Authorization: Bearer $MY_API_KEY"
+> ```
+> 返回服务端已上架的模型清单(`SUPPORT_LLMS`);照抄其中的 `id` 作为下文各示例里的 `model` 即可。
+
 ---
 
 ### 6.1 路由一:BYOK(无前缀,用你自己的 provider key,不扣 credits)
