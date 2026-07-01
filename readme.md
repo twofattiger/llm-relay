@@ -11,7 +11,12 @@
 
 此外，本项目内置 **OpenAI ↔ Anthropic 协议转换**（`src/translate.js`，类 OpenRouter）：当 Anthropic 入口 (`/v1/messages`) 收到一个**非 Claude 模型**时，Worker 会自动把请求体从 Anthropic Messages 格式翻译成 OpenAI Chat Completions 格式发往上游，再把响应（含流式 SSE）翻译回 Anthropic 格式。这样 **Claude Code、Anthropic SDK 等只会说 Anthropic 协议的客户端，也能直接驱动 DeepSeek / Workers AI / GPT 等非 Claude 模型**。
 
-该代理统一隐藏了 Cloudflare 账号凭证和各大模型提供商的 API Key，对外用你自定义的 API Key 鉴权（一个 `MY_API_KEY` master 兜底，外加可在 `/admin` 面板**动态签发、带名称与有效期**的多把 key，存于公用 Durable Object），同时完整保留 AI Gateway 的请求日志、用量分析等可观测性功能。
+该代理统一隐藏了 Cloudflare 账号凭证和各大模型提供商的 API Key，对外用你自定义的 API Key 鉴权（一个 `MY_API_KEY` master 兜底，外加可在 `/admin` 面板**动态签发、带名称与有效期、可限定可用模型**的多把 key，存于公用 Durable Object），同时完整保留 AI Gateway 的请求日志、用量分析等可观测性功能。
+
+> **查询可用模型：** 使用者可用 OpenAI 兼容接口 `GET /v1/models`（带你的 key）拿到本服务已上架的模型清单：
+> ```bash
+> curl "https://<你的worker地址>/v1/models" -H "Authorization: Bearer <你的key>"
+> ```
 
 ![后台管理面板主界面](./src/images/main.jpg)
 
